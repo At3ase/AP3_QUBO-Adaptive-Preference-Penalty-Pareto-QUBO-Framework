@@ -6,7 +6,8 @@ Checklist:
   [2] Variables created via kw.Binary() (not manual)
   [3] Constraint expressions built via kaiwu (not numpy matrices)
   [4] QuboModel built via kaiwu + set_objective
-  [5] Solver uses kw.QuboSolver().solve_qubo()
+  [5] Solver TOP-K Ising chain (qubo_model_to_ising_model +
+      get_sorted_solutions), runtime-probed
   [6] Variable naming: e{ei}_b{bj} (avoids kaiwu index collision)
   [7] Solution parsing correct
   [8] Golden reference values match
@@ -111,35 +112,43 @@ print("\n" + "=" * 70)
 print("[Check 3] Expression building — kaiwu, not numpy matrices")
 print("=" * 70)
 
-methods_to_check = [
-    "_build_composition_exprs",
-    "_build_f1_expr",
-    "_build_f2_expr",
-    "_build_f3_expr",
-    "_build_P0_expr",
-    "_build_P1_expr",
-    "_build_P2_expr",
-]
-
-for mname in methods_to_check:
-    src = ins.getsource(getattr(builder, mname))
-    uses_kaiwu = any(kw in src for kw in ["quicksum", "BinaryExpression", "c_expr[", "expr"])
-    uses_numpy_mat = "np.zeros" in src and "h_vec" in src
-    status = PASS if uses_kaiwu and not uses_numpy_mat else WARN
-    print(f"  {status} {mname}: kaiwu_api={uses_kaiwu}, numpy_matrix={uses_numpy_mat}")
-
-# Actually build expressions and verify types
+# 第 3 批修复：原 :126 以源码子串 any(["quicksum", "BinaryExpression",
+# "c_expr[", "expr"]) 判别——"expr" 在 docstring/变量名中恒真，无判别力。
+# 改为运行时判别：实际调用各表达式构建方法（builder 已在 Check 2
+# 实例化），断言产物为 kaiwu 表达式（kaiwu.core 模块对象，实测
+# BinaryExpression）且非 numpy 矩阵（旧 numpy 实现的判别特征）。
 c_expr = builder._build_composition_exprs(xs)
-print(f"\n  Composition expression elements: {list(c_expr.keys())}")
-for elem, expr in list(c_expr.items())[:3]:
-    print(f"    {elem}: type={type(expr).__name__}")
-
 p0_expr = builder._build_P0_expr(c_expr)
 p1_expr = builder._build_P1_expr(c_expr)
 p2_expr = builder._build_P2_expr(c_expr)
 f1_expr = builder._build_f1_expr(c_expr)
 f2_expr = builder._build_f2_expr(c_expr)
 f3_expr = builder._build_f3_expr(c_expr)
+
+runtime_exprs = {
+    "_build_composition_exprs": c_expr["Al"],  # dict 产物，取代表元素
+    "_build_f1_expr": f1_expr,
+    "_build_f2_expr": f2_expr,
+    "_build_f3_expr": f3_expr,
+    "_build_P0_expr": p0_expr,
+    "_build_P1_expr": p1_expr,
+    "_build_P2_expr": p2_expr,
+}
+
+for mname, expr_obj in runtime_exprs.items():
+    mod = type(expr_obj).__module__
+    is_kaiwu_expr = mod.startswith("kaiwu")
+    is_numpy = isinstance(expr_obj, np.ndarray)
+    status = PASS if (is_kaiwu_expr and not is_numpy) else FAIL
+    print(f"  {status} {mname}: type={type(expr_obj).__name__}, "
+          f"module={mod}, numpy_matrix={is_numpy}")
+    if not is_kaiwu_expr or is_numpy:
+        print(f"  {FAIL} {mname} did not produce a kaiwu expression!")
+        sys.exit(1)
+
+print(f"\n  Composition expression elements: {list(c_expr.keys())}")
+for elem, expr in list(c_expr.items())[:3]:
+    print(f"    {elem}: type={type(expr).__name__}")
 
 for label, expr in [("P0", p0_expr), ("P1", p1_expr), ("P2", p2_expr),
                      ("f1", f1_expr), ("f2", f2_expr), ("f3", f3_expr)]:
@@ -193,57 +202,91 @@ print(f"  {PASS} Check 4 complete")
 
 
 # ===========================================================================
-# [Check 5] Solver uses kw.QuboSolver().solve_qubo()
+# [Check 5] Solver TOP-K Ising chain (runtime probe first)
 # ===========================================================================
 print("\n" + "=" * 70)
-print("[Check 5] Solver chain verification")
+print("[Check 5] Solver chain verification (TOP-K Ising chain)")
 print("=" * 70)
 
 from ap3_qubo.solver.kaiwu_solver import KaiwuSolver
 
-# Check solve_from_model source
-src_sfm = ins.getsource(KaiwuSolver.solve_from_model)
-has_kw_solver = "kw.QuboSolver()" in src_sfm or "kw.QuboSolver(" in src_sfm
-has_solve_qubo = "solve_qubo" in src_sfm
-print(f"  solve_from_model uses kw.QuboSolver(): {has_kw_solver}")
-print(f"  solve_from_model uses .solve_qubo(): {has_solve_qubo}")
+# 第 3 批重写：旧断言要求 solve_from_model 源码含 kw.QuboSolver()/
+# solve_qubo——那是第 2 批已修复替换的旧错误实现（kaiwu-community 的
+# solve_qubo 只返回单个最优解、不接受 num_reads，TOP-K 断链，审查 P0-3）。
+# 现改为「运行时探针优先 + 源码信息级确认」（运行时实测比源码字符串
+# 匹配更稳）：
+#   (a) 运行时小矩阵实测——验证求解器真的在最小化 QUBO 能量；
+#   (b) 信息级确认新链路标识 qubo_model_to_ising_model /
+#       get_sorted_solutions（kaiwu_solver.py:283-298）。
 
-if not has_kw_solver or not has_solve_qubo:
-    print(f"  {FAIL} Solver not using kaiwu SDK!")
+# (a) 运行时探针：E(x) = x0 + x1，真最小值在 bits=[0,0]，E=0
+print("  [runtime probe] 2-var QUBO E = x0 + x1 (true min: bits=[0,0], E=0)")
+probe_solver = KaiwuSolver(mode="simulator", seed=42)
+probe_mat = np.array([[1.0, 0.0], [0.0, 1.0]])
+probe_res = probe_solver.solve(probe_mat, num_reads=20, top_k=5)
+
+if not probe_res.solutions:
+    print(f"  {FAIL} Runtime probe returned no solutions!")
     sys.exit(1)
 
-# Check solve (compatibility path)
+probe_best = probe_res.solutions[0]
+print(f"    probe best bits: {probe_best.bits.tolist()}, "
+      f"energy: {probe_best.energy:.6f}")
+if probe_best.energy > 1e-6 or int(probe_best.bits.sum()) != 0:
+    print(f"  {FAIL} Runtime probe missed the true minimum!")
+    sys.exit(1)
+print(f"  {PASS} Runtime probe: solver truly minimizes QUBO energy")
+
+# (b) 新 TOP-K 链路标识（信息级；主判据是上面的运行时探针）
+src_core = ins.getsource(KaiwuSolver._solve_model)
+has_ising_chain = (
+    "qubo_model_to_ising_model" in src_core
+    and "get_sorted_solutions" in src_core
+)
+print(f"  _solve_model uses qubo_model_to_ising_model / "
+      f"get_sorted_solutions: {has_ising_chain}")
+if not has_ising_chain:
+    print(f"  {FAIL} Solver core not using the TOP-K Ising chain!")
+    sys.exit(1)
+
+# 兼容路径信息（solve: numpy 矩阵 -> qubo_matrix_to_qubo_model -> 同一核心）
 src_s = ins.getsource(KaiwuSolver.solve)
 has_q2m = "qubo_matrix_to_qubo_model" in src_s
-has_kw_s2 = "kw.QuboSolver()" in src_s or "kw.QuboSolver(" in src_s
 print(f"  solve (compat) uses qubo_matrix_to_qubo_model: {has_q2m}")
-print(f"  solve (compat) uses kw.QuboSolver(): {has_kw_s2}")
 
-# Check variable name parser
-src_parse = ins.getsource(KaiwuSolver._parse_solution)
-has_ei_bj = "e(\\d+)_b(\\d+)" in src_parse or "e(\\\\d+)_b(\\\\d+)" in src_parse or "e" in src_parse
-print(f"  Parser handles e{{ei}}_b{{bj}} format: True")
-
-# Attempt actual solve
-print(f"\n  Attempting solve via kaiwu SDK...")
+# 变量名解析运行时验证（原 :224 源码子串 "e" 恒真，改为实测解析）
 solver = KaiwuSolver(mode="auto")
+parse_dict = {"e0_b0": 1, "e3_b5": 1, "e5_b2": 1}
+probe_bits = solver._parse_solution(parse_dict, 38)
+parse_ok = (int(probe_bits[0]) == 1 and int(probe_bits[3 * 7 + 5]) == 1
+            and int(probe_bits[37]) == 1 and int(probe_bits.sum()) == 3)
+print(f"  _parse_solution e{{ei}}_b{{bj}} runtime parse: {parse_ok}")
+if not parse_ok:
+    print(f"  {FAIL} _parse_solution mis-parsed builder var names!")
+    sys.exit(1)
+
+# 38 变量真实模型端到端求解（新链路 + TOP-K 排序 + 可行性判定）
+print(f"\n  Attempting 38-var solve via new TOP-K chain...")
 try:
-    result = solver.solve_from_model(model, n_vars=38)
+    result = solver.solve_from_model(model, n_vars=38, num_reads=100, top_k=10)
     print(f"  Solve succeeded!")
     print(f"  Solutions found: {len(result.solutions)}")
-    if result.solutions:
-        sol = result.solutions[0]
-        print(f"  Best energy: {sol.energy:.6f}")
-        print(f"  Bit sum: {sol.bits.sum()}")
-    print(f"  {PASS} Check 5 complete (real/simulator solve)")
-except NotImplementedError as e:
-    print(f"  {WARN} kaiwu backend not available (NotImplementedError)")
-    print(f"  {INFO} Expected — kaiwu SDK installed but no CIM/sim backend")
-    print(f"  {INFO} Expression + model chain verified; only solve needs backend")
-    print(f"  {PASS} Check 5 complete (API chain verified)")
-except Exception as e:
-    print(f"  {WARN} Solve error (likely no backend): {type(e).__name__}: {e}")
-    print(f"  {INFO} This is OK — API chain is verified at code level")
+    if not result.solutions:
+        print(f"  {FAIL} 38-var solve returned no solutions!")
+        sys.exit(1)
+    sol = result.solutions[0]
+    n_feas = sum(1 for s in result.solutions if s.is_feasible)
+    print(f"  Best energy: {sol.energy:.6f}")
+    print(f"  Bit sum: {sol.bits.sum()}")
+    print(f"  Feasible solutions: {n_feas}/{len(result.solutions)} "
+          f"(|sum_c - 100| <= 1%)")
+    energies = [s.energy for s in result.solutions]
+    assert energies == sorted(energies), "TOP-K solutions not energy-sorted!"
+    print(f"  TOP-K order: energy ascending OK")
+    print(f"  {PASS} Check 5 complete (TOP-K Ising chain, runtime verified)")
+except RuntimeError as e:
+    print(f"  {FAIL} Solve failed: {e}")
+    sys.exit(1)
 
 
 # ===========================================================================
@@ -418,8 +461,10 @@ print(f"""
     -> return model                                       (kaiwu QuboModel)
 
   KaiwuSolver.solve_from_model(model, n_vars)
-    -> solver = kw.QuboSolver()                           (kaiwu solver)
-    -> solution_dict, energy = solver.solve_qubo(model)   (kaiwu solve)
+    -> kw.qubo_model_to_ising_model(model)                (QUBO -> Ising)
+    -> simulator/CIM sampling (num_reads candidates)      (backend)
+    -> kw.get_sorted_solutions(...)                       (TOP-K by energy)
+    -> kw.get_sol_dict(...) -> bits                       (negtail reduce)
     -> return SolverResult                                (our wrapper)
 """)
 
@@ -439,7 +484,8 @@ print(f"""
     kw.Binary() variables -> quicksum() expressions -> kw.QuboModel() -> set_objective()
 
   SOLVE PATH:
-    kw.QuboSolver() -> .solve_qubo(QuboModel) -> solution dictionary
+    kw.qubo_model_to_ising_model() -> sample num_reads ->
+    kw.get_sorted_solutions() (TOP-K) -> kw.get_sol_dict() -> bits
 
   NO manual numpy QUBO matrix assembly is used as the primary path.
   The constraint modules (sum_constraint.py, carbide_constraint.py,

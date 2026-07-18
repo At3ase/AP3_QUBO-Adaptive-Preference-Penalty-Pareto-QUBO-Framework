@@ -23,6 +23,11 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+]
+# 方案 H-04 必需实验对照组（NSGA-II 基线，实验 3）：
+# deap 不是可选开发工具，而是跑对比实验的硬依赖——
+# 缺失时 nsga2_baseline 显式抛 ImportError（P0-6 修复）。
+experiments = [
     "deap>=1.4",
 ]
 notebooks = [

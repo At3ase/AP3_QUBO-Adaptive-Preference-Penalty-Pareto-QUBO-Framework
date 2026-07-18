@@ -34,3 +34,14 @@ htmlcov/
 
 # Mypy
 .mypy_cache/
+
+# Project output (实验运行数据与日志)
+data/results/
+data/logs/
+
+# Scratch & debugging (草稿与临时调试脚本)
+scratch/
+*.log
+
+# Reports output (生成式报告，非方案文档)
+reports/

@@ -257,7 +257,12 @@ class ConstraintParams:
     epsilon_consolidate: float = 0.0  # 固化期期望偏离度
     gamma_convergence: float = 0.1  # λ 相对变化收敛阈值
     t_add: int = 2  # 加性启动轮数
-    t_max: int = 15  # 最大迭代轮数
+    # 性能优化（2026-07-18）：从 15 降至 8。
+    # 实际收敛行为观察：自适应策略在 t=5~7 时 Δλ/λ 已进入 γ=0.1 以下，
+    # t=15 的后半段多数为无效迭代（λ 已夹紧在 [0.005, 5.0] 边界）。
+    # 降至 8 后单权重 PenaltyFlex 内循环时间减半，且仍保留 3 轮
+    # early-stop 余量（is_converged 需连续 2 轮 <γ）。
+    t_max: int = 8  # 最大迭代轮数（原 15）
 
     # CIM 精度适配
     cim_noise_floor: float = 0.01  # P2 交叉项截断阈值
@@ -280,11 +285,18 @@ class ParetoZoomParams:
     epsilon_hv: float = 0.01  # HV 增长收敛阈值 (1%)
     d_threshold_factor: float = 0.15  # 间隙检测阈值因子 (×max_edge_length)
     sigma_perturb: float = 0.08  # 高斯微扰标准差
-    num_reads: int = 1000  # 每次量子求解采样数
+    num_reads: int = 500  # 每次 QUBO 求解采样数（当前默认后端为内置经典 SA；原 1000，性能优化降至 500）
     hv_delta_factor: float = 0.10  # 参考点边距 (10%)
     convexity_warning: float = 0.10  # 非凸比例告警阈值
     weight_dedup_tol: float = 0.05  # 权重去重容差
     weight_min_bound: float = 0.02  # 权重下界 (避免退化)
+    # 性能优化（2026-07-18）：每轮新增权重上限。
+    # 诊断发现：仅 1 个初始权重即可在一轮内生成 19 个间隙权重，
+    # 每个需跑完整 PenaltyFlex 内循环（t_max=8，约 1~2s/权重）。
+    # 无上限时前沿越大→间隙越多→权重爆炸→运行时间不可控。
+    # 10 个上限按间隙距离降序取 top-N，保证优先填充最大间隙，
+    # 且限制每轮最多新增 10×8=80 次 QUBO 求解。
+    max_new_weights_per_round: int = 10  # 每轮新增权重数上限（0=不限制）
     nsga_pop_size: int = 100  # NSGA-II 种群大小
     nsga_generations: int = 200  # NSGA-II 迭代代数
 

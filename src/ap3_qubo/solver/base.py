@@ -71,7 +71,7 @@ class SolverResult:
 class AbstractSolver(ABC):
     """求解器抽象基类。
 
-    所有求解器 (kaiwu 真机 / kaiwu 模拟器 / 第三方) 必须实现此接口。
+    所有求解器 (kaiwu 真机 / 内置经典 SA 模拟后端 / 第三方) 必须实现此接口。
     """
 
     @abstractmethod
