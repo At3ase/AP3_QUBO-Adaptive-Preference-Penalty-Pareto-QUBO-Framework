@@ -10,8 +10,11 @@
 
 指标:
   - ΔHV_i: HV 差值
-  - AR_i: 消融贡献率 |ΔHV_i| / HV_Full × 100%（目标 > 3%）
+  - AR_i: 消融贡献率（带符号口径，见下方"任务 C"）
   - Synergy: 协同效应
+  - 配对 Wilcoxon + Bonferroni（方案 §5.1/§5.2，审计 D-6）：
+    Full vs 各 Abl 逐 rep HV 配对检验，校正后 p 值随
+    compute_contributions 写入报告（results.json）。
 
 第 3 批修复（审查报告 Code_Completion_Review_2026-07-18）：
   - P0-5：每次重复内 5 配置全部跑完后，用 set_unified_reference
@@ -22,18 +25,55 @@
     "在 {0.1,0.5,1,5,10,50,100} 上穷举搜索最优固定 λ"）。
   - AR_i 口径修正为 |ΔHV_i| / HV_Full（方案 完整技术路线v2.0 :545），
     原实现带负号与方案不符。
+
+任务 C（2026-07-19，诊断报告 reports/feasible_hv_diagnostic_2026-07-19）
+评价口径修正，为消融重跑做准备：
+  - AR/Synergy 改带符号口径 AR_i = (HV_Full − HV_i)/HV_Full × 100
+    （正值 = 组件有正贡献，去掉它 HV 下降）；旧绝对值口径废弃，
+    仅以 *_abs_legacy 字段保留供与旧数据对照。
+  - records 的 feasible_rate / physical_pass_rate 由占位符 1.0
+    改为用 PhysicalFilter 对前沿成分实际计算：feasible_rate 为
+    硬口径（仅 FAIL 级：Ω 不稳定 / 碳化物高风险 / 成分和超差）
+    可行率，physical_pass_rate 为 strict all_pass 通过率（诊断
+    报告 §2.2：该口径下 Full 可行率 0%，仅作记录不作门槛）；
+    VEC/δ/Ω/ΔH_mix 各窗口单独通过率作为软指标记入 extra。
+  - 新增 feasible_hv：对硬口径可行子集在同一统一参考点上计算
+    HV（compute_feasible_hv，validation/hypervolume.py），并输出
+    基于 feasible_hv 的 Feasible_AR_* / Feasible_Synergy。
+  - 每 rep 每配置的 Pareto 前沿（目标值 + 成分 + 硬口径可行掩码）
+    落盘 fronts/{config}_rep{NN}.npz（run() 传 fronts_dir 时）。
+  - 入档容差统一：grid-search 试跑的 |Σc−100| 过滤由 2% 改为 1%，
+    与 SUM_TOLERANCE（physical_params.py）及 ParetoZoom
+    archive_feasible_tol 新默认值一致（诊断报告 §5 决策 2）。
 """
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ..physical_params import COARSE_WEIGHTS, MAIN_ELEMENTS, INTERSTITIAL_ELEMENT
+from ..physical_params import (
+    ALL_ELEMENTS,
+    COARSE_WEIGHTS,
+    MAIN_ELEMENTS,
+    INTERSTITIAL_ELEMENT,
+)
 from ..exploration.pareto_zoom import ParetoZoom
 from ..exploration.archive import Archive
 from ..encoding.precision_split import Composition, PrecisionSplitDecoder
-from ..validation.hypervolume import HypervolumeCalculator, set_unified_reference
+from ..validation.hypervolume import (
+    HypervolumeCalculator,
+    compute_feasible_hv,
+    set_unified_reference,
+)
+from ..validation.physical_filters import PhysicalFilter
+# 直接from子模块导入（不依赖 statistics/__init__.py 导出表，
+# 该文件不在本批改动边界内）
+from ..statistics.hypothesis_tests import (
+    bonferroni_correction,
+    wilcoxon_signed_rank,
+)
 
 # 方案 BASE-4 网格（AP3_QUBO_Validation_Scheme_v1.1 §4.2 :160，
 # "Grid-search最优λ：在{0.1,0.5,1,5,10,50,100}上穷举搜索最优固定λ"，
@@ -51,14 +91,22 @@ class AblationResult:
         hv: Hypervolume 值（统一参考点口径，同一次重复内 5 配置共享
             同一参考点，跨重复参考点随当次解集重定）。
         front_size: 前沿解数量。
-        feasible_rate: 可行解比例。
-        physical_pass_rate: 物理过滤器通过率。
+        feasible_rate: 硬口径可行率——仅排除 FAIL 级（Ω 不稳定 /
+            碳化物高风险 / 成分和超差），任务 C 起由 PhysicalFilter
+            对前沿成分实际计算；前沿为空时为 NaN（原默认 1.0 为
+            占位符，诊断报告 §1 确认其从未被赋值、已废弃）。
+        physical_pass_rate: strict all_pass 物理过滤器通过率（诊断
+            报告 §2.2：VEC 窗口结构性不可达使该口径全配置归零，
+            仅作记录，不作门槛）；前沿为空时为 NaN。
+        feasible_hv: 硬口径可行子集的 HV（与 hv 同一统一参考点，
+            compute_feasible_hv）；无可行点或前沿为空时为 NaN。
     """
     config_name: str
     hv: float
     front_size: int
-    feasible_rate: float = 1.0
-    physical_pass_rate: float = 1.0
+    feasible_rate: float = float("nan")
+    physical_pass_rate: float = float("nan")
+    feasible_hv: float = float("nan")
     extra: Dict = field(default_factory=dict)
 
 
@@ -234,6 +282,7 @@ class AblationRunner:
         n_repetitions: int = 20,
         seed: int = 42,
         configs: Optional[List[str]] = None,
+        fronts_dir: Optional[str] = None,
     ) -> Dict[str, List[AblationResult]]:
         """运行完整消融实验。
 
@@ -242,6 +291,12 @@ class AblationRunner:
             seed: 随机种子基数。
             configs: 可选，只运行指定配置子集（小规模调试用）；
                 默认 None 运行全部 5 配置。
+            fronts_dir: 可选，前沿落盘目录（任务 C）。给定时每 rep
+                每配置保存 fronts_dir/{config}_rep{NN}.npz，含
+                objectives (N,3)、fractions (N,6)（列序为
+                ALL_ELEMENTS）、elements、hard_feasible 掩码，
+                供 feasible-HV 分析与物理核查复用；前沿为空时也
+                落盘（空数组），保证可追溯。
 
         Returns:
             {config_name: [AblationResult, ...]}。
@@ -250,6 +305,15 @@ class AblationRunner:
         for name in names:
             if name not in self._configs:
                 raise ValueError(f"未知配置: {name!r}，可选 {list(self._configs.keys())}")
+
+        fronts_path: Optional[Path] = None
+        if fronts_dir is not None:
+            fronts_path = Path(fronts_dir)
+            fronts_path.mkdir(parents=True, exist_ok=True)
+
+        # 任务 C：物理过滤器实例（每 rep 对前沿成分实算可行指标，
+        # 纯 Python 评估约百点，成本可忽略）
+        filt = PhysicalFilter()
 
         all_results: Dict[str, List[AblationResult]] = {name: [] for name in names}
 
@@ -262,35 +326,106 @@ class AblationRunner:
             # 原实现在 _run_single_config 内各自 set_reference_from_data，
             # 组间 HV 差异会混入参考点漂移）。
             obj_mats: Dict[str, np.ndarray] = {}
+            frac_lists: Dict[str, List[Dict[str, float]]] = {}
             meta: Dict[str, Tuple[int, Dict]] = {}
 
             for config_name in names:
                 try:
                     # B-1：seed+rep 贯通到 ParetoZoom 默认求解器与
                     # BASE-4 试跑求解器，同 seed 结果逐位一致
-                    mat, front_size, extra = self._run_single_config(
+                    mat, front_size, extra, fractions = self._run_single_config(
                         config_name, self._configs[config_name],
                         rep_seed=seed + rep,
                     )
                 except Exception as e:
                     # 记录失败但不中断
-                    mat, front_size, extra = (
+                    mat, front_size, extra, fractions = (
                         np.zeros((0, 3)),
                         0,
                         {"error": str(e)},
+                        [],
                     )
                 obj_mats[config_name] = mat
+                frac_lists[config_name] = fractions
                 meta[config_name] = (front_size, extra)
 
             hv_vals = _compute_hv_unified(obj_mats)
+            # 任务 C：feasible-HV 与 hv 共用同一统一参考点（所有配置
+            # 合并前沿上 set_unified_reference(margin=0.10) 定标，
+            # 保持组间可比；与 _compute_hv_unified 内部口径一致）
+            ref_point = (
+                set_unified_reference(obj_mats, margin=0.10)
+                if any(len(m) > 0 for m in obj_mats.values())
+                else None
+            )
 
             for config_name in names:
                 front_size, extra = meta[config_name]
+                mat = obj_mats[config_name]
+                fractions = frac_lists[config_name]
+
+                # 任务 C：真实可行指标（替换原 1.0 占位符）。
+                # f1 即原始 ΔH_mix（objectives/mixing_enthalpy.py），
+                # 直接作为 PhysicalFilter 的 dh_mix 输入。
+                feasible_rate = float("nan")
+                physical_pass_rate = float("nan")
+                feasible_hv = float("nan")
+                hard_mask = np.zeros(len(mat), dtype=bool)
+                if len(mat) > 0 and len(fractions) == len(mat):
+                    evals = filt.evaluate_batch(
+                        fractions, [float(v) for v in mat[:, 0]]
+                    )
+                    hard_mask = np.array([
+                        (e.omega_level != "unstable")
+                        and (e.carbide_risk != "high")
+                        and e.sum_pass
+                        for e in evals
+                    ], dtype=bool)
+                    feasible_rate = float(hard_mask.mean())
+                    # strict all_pass 仅作记录（诊断报告 §2.2：该口径
+                    # 结构性归零，不可用作硬门槛）
+                    physical_pass_rate = float(
+                        np.mean([e.all_pass for e in evals])
+                    )
+                    # 软指标：各窗口单独通过率，单列不进门槛
+                    extra["soft_pass_rates"] = {
+                        "vec": float(np.mean([e.vec_pass for e in evals])),
+                        "delta": float(np.mean([e.delta_pass for e in evals])),
+                        "omega": float(np.mean(
+                            [e.omega_level != "unstable" for e in evals]
+                        )),
+                        "dh_mix": float(np.mean(
+                            [e.dh_mix_in_range for e in evals]
+                        )),
+                    }
+                    if ref_point is not None:
+                        feasible_hv = compute_feasible_hv(
+                            mat, hard_mask, ref_point
+                        )
+
+                # 任务 C：前沿落盘（目标值 + 成分 + 硬口径可行掩码）
+                if fronts_path is not None:
+                    frac_arr = np.array(
+                        [[f.get(e, 0.0) for e in ALL_ELEMENTS]
+                         for f in fractions],
+                        dtype=float,
+                    ).reshape(-1, len(ALL_ELEMENTS))
+                    np.savez(
+                        fronts_path / f"{config_name}_rep{rep:02d}.npz",
+                        objectives=mat,
+                        fractions=frac_arr,
+                        elements=np.array(list(ALL_ELEMENTS)),
+                        hard_feasible=hard_mask,
+                    )
+
                 all_results[config_name].append(
                     AblationResult(
                         config_name=config_name,
                         hv=hv_vals[config_name],
                         front_size=front_size,
+                        feasible_rate=feasible_rate,
+                        physical_pass_rate=physical_pass_rate,
+                        feasible_hv=feasible_hv,
                         extra=extra,
                     )
                 )
@@ -299,14 +434,18 @@ class AblationRunner:
 
     def _run_single_config(
         self, name: str, config: Dict, rep_seed: Optional[int] = None
-    ) -> Tuple[np.ndarray, int, Dict]:
-        """运行单个配置，返回 (目标矩阵 (N,3), 前沿解数, 附加信息)。
+    ) -> Tuple[np.ndarray, int, Dict, List[Dict[str, float]]]:
+        """运行单个配置，返回 (目标矩阵 (N,3), 前沿解数, 附加信息, 前沿成分列表)。
 
         根据 config 中的 use_precision_split / use_penalty_flex / use_pareto_zoom
         标志，创建不同配置的 ParetoZoom 实例。
 
         HV 不在此计算——由 run() 收集齐本次重复全部配置的目标矩阵后，
         用统一参考点一次性计算（P0-5 / 方案 HV-1）。
+
+        前沿成分列表（任务 C 新增第 4 个返回值）来自
+        Archive.get_fractions_of_front()，与目标矩阵逐点对齐，
+        供 run() 计算真实可行指标、feasible-HV 与前沿落盘。
 
         rep_seed: 本次重复的随机种子（seed+rep，B-1），透传到 ParetoZoom
             默认求解器与 BASE-4 试跑求解器；pareto_zoom_kwargs 显式给定
@@ -337,7 +476,7 @@ class AblationRunner:
             except (NotImplementedError, RuntimeError, ImportError):
                 # 求解器不可用 / 试跑全失败 → 与主流程同口径走占位
                 extra["solver_available"] = False
-                return np.zeros((0, 3)), 0, extra
+                return np.zeros((0, 3)), 0, extra, []
             extra["grid_search"] = gs_detail
 
         # 探索策略
@@ -365,11 +504,16 @@ class AblationRunner:
             if encoding_type != "precision_split_38":
                 pz._decoder = _build_decoder(encoding_type)
             archive, rounds = pz.run()
-            return archive.get_objective_matrix(), archive.front_size, extra
+            return (
+                archive.get_objective_matrix(),
+                archive.front_size,
+                extra,
+                archive.get_fractions_of_front(),
+            )
         except (NotImplementedError, RuntimeError, ImportError):
             # 求解器不可用 → 返回空矩阵，由 run() 记占位结果用于框架验证
             extra["solver_available"] = False
-            return np.zeros((0, 3)), 0, extra
+            return np.zeros((0, 3)), 0, extra, []
 
     def _grid_search_fixed_lambda(
         self, encoding_type: str, seed: Optional[int] = None
@@ -389,9 +533,9 @@ class AblationRunner:
         BASE-4 口径不符，且无试跑预算参数；pareto_zoom.py 由其他
         代理负责，故此处用现有组件（QUBOBuilder / KaiwuSolver /
         解码器 / 目标计算器）实现 BASE-4 最小版本，不改动
-        pareto_zoom.py。试跑的 TOP-10 截取与 2% 可行性过滤同
-        ParetoZoom._solve_single_iteration 口径
-        （方案 §4.2.3 阶段D 步骤35）。
+        pareto_zoom.py。试跑的 TOP-10 截取与 1% 可行性过滤同
+        ParetoZoom 入档口径（任务 C 容差统一后 archive_feasible_tol
+        默认 1.0，方案 §4.2.3 阶段D 步骤35）。
 
         Args:
             encoding_type: 编码方案（决定 QUBOBuilder 变量布局）。
@@ -457,9 +601,12 @@ class AblationRunner:
                         comp = decoder.decode(sol.bits)
                     except ValueError:
                         continue
-                    # 2% 可行性过滤（方案 §4.2.3 阶段D 步骤35，
-                    # 与 ParetoZoom 入档容差 archive_feasible_tol=2.0 同口径）
-                    if abs(comp.total - 100.0) > 2.0:
+                    # 1% 可行性过滤（任务 C 容差统一：与 SUM_TOLERANCE
+                    # （physical_params.py）及 ParetoZoom 入档容差
+                    # archive_feasible_tol=1.0 同口径；原为 2%，
+                    # 与过滤容差不一致会在 1–2% 夹层制造口径灰区，
+                    # 诊断报告 §2.4 根因 3 / §5 决策 2）
+                    if abs(comp.total - 100.0) > 1.0:
                         continue
                     pts.append((
                         dh_calc.evaluate(comp.fractions),
@@ -499,29 +646,64 @@ class AblationRunner:
     ) -> Dict[str, float]:
         """计算各创新的消融贡献率 AR_i 和协同效应。
 
-        方案口径（完整技术路线v2.0 :544-546 / 第一性原理解释版 :409-411）：
-          ΔHV_i   = HV_Abl-i - HV_Full（越负，贡献越大）
-          AR_i    = |ΔHV_i| / HV_Full × 100%（目标：每个 AR_i > 3%）
-          Synergy = Σ|AR_i| - |HV_Abl-4 - HV_Full| / HV_Full × 100%
+        任务 C 带符号口径（2026-07-19，诊断报告
+        reports/feasible_hv_diagnostic_2026-07-19）：
+          ΔHV_i   = HV_Abl-i − HV_Full
+          AR_i    = (HV_Full − HV_i) / HV_Full × 100%
+                    （正值 = 组件有正贡献，去掉它 HV 下降；
+                     负值 = 去掉组件 HV 反升，即组件在该口径下为负贡献）
+          Synergy = Σ AR_i − (HV_Full − HV_Abl-4) / HV_Full × 100%
                     （> 0 表示三创新存在正协同）
 
-        第 3 批修正：AR 原实现为带负号的 (HV_Abl - HV_Full) / HV_Full，
-        与方案 |ΔHV| 口径不符，已修正为绝对值。
+        旧绝对值口径（第 3 批，AR_i = |ΔHV_i| / HV_Full）已废弃——
+        绝对值会把"去掉组件 HV 反升"伪装成正贡献（诊断报告 §3.1
+        的 HV 方向性矛盾即源于此）；仅以 *_abs_legacy 字段保留，
+        供与 formal_exp0_reps20 等旧数据对照，不得用于结论。
+
+        另输出基于 feasible_hv（硬口径可行子集 HV）的
+        Feasible_AR_* / Feasible_Synergy（同为带符号口径）；
+        无可行 HV 数据时对应字段记 NaN。
 
         Args:
             results: run() 的输出。
 
         Returns:
-            {"AR_PrecisionSplit": ..., "AR_PenaltyFlex": ..., "AR_ParetoZoom": ..., "Synergy": ...}
+            {"AR_PrecisionSplit": ..., "AR_PenaltyFlex": ..., "AR_ParetoZoom": ...,
+             "AR_*_abs_legacy": ...（旧口径，已废弃，仅供对照）,
+             "Synergy": ..., "Synergy_abs_legacy": ...,
+             "Feasible_AR_*": ..., "Feasible_Synergy": ...,
+             "AR_convention": 口径说明字符串,
+             "Wilcoxon_Bonferroni": {...}}
+            其中 Wilcoxon_Bonferroni 为审计 D-6 接入的配对显著性块
+            （见 compute_pairwise_significance）。
         """
-        hv_full = np.mean([r.hv for r in results.get("Full", []) if r.hv > 0])
-        if hv_full < 1e-12:
+        hv_full_vals = [r.hv for r in results.get("Full", []) if r.hv > 0]
+        if not hv_full_vals:
             return {}
+        hv_full = float(np.mean(hv_full_vals))
 
         hv_abl = {}
         for name in ["Abl-1", "Abl-2", "Abl-3", "Abl-4"]:
             vals = [r.hv for r in results.get(name, []) if r.hv > 0]
-            hv_abl[name] = np.mean(vals) if vals else 0.0
+            # 全失败配置记 NaN（不再以 0.0 占位——原口径下 |0−HV_Full|/HV_Full
+            # 会误报 AR=100%，把"无数据"伪装成"最大贡献"）。
+            hv_abl[name] = float(np.mean(vals)) if vals else float("nan")
+
+        # feasible_hv 均值（NaN 表示无可行点，不参与平均）
+        feas_full_vals = [
+            r.feasible_hv for r in results.get("Full", [])
+            if not np.isnan(r.feasible_hv)
+        ]
+        feas_full = (
+            float(np.mean(feas_full_vals)) if feas_full_vals else float("nan")
+        )
+        feas_abl = {}
+        for name in ["Abl-1", "Abl-2", "Abl-3", "Abl-4"]:
+            vals = [
+                r.feasible_hv for r in results.get(name, [])
+                if not np.isnan(r.feasible_hv)
+            ]
+            feas_abl[name] = float(np.mean(vals)) if vals else float("nan")
 
         ar_mapping = {
             "AR_PrecisionSplit": "Abl-1",
@@ -531,14 +713,166 @@ class AblationRunner:
 
         contributions = {}
         sum_ar = 0.0
+        sum_ar_abs = 0.0
+        sum_ar_feas = 0.0
         for ar_name, abl_name in ar_mapping.items():
-            # 方案口径：AR_i = |ΔHV_i| / HV_Full × 100%
-            ar = abs(hv_abl[abl_name] - hv_full) / hv_full * 100.0
-            contributions[ar_name] = round(ar, 2)
-            sum_ar += ar
+            # 任务 C 带符号口径：AR_i = (HV_Full − HV_i) / HV_Full × 100%
+            if np.isnan(hv_abl[abl_name]):
+                contributions[ar_name] = float("nan")  # 无有效重复，无法判定
+                contributions[ar_name + "_abs_legacy"] = float("nan")
+            else:
+                ar = (hv_full - hv_abl[abl_name]) / hv_full * 100.0
+                contributions[ar_name] = round(ar, 2)
+                # 旧绝对值口径（已废弃，仅供与旧数据对照）
+                ar_abs = abs(hv_abl[abl_name] - hv_full) / hv_full * 100.0
+                contributions[ar_name + "_abs_legacy"] = round(ar_abs, 2)
+                sum_ar += ar
+                sum_ar_abs += ar_abs
+            # feasible-HV 口径（带符号；任一侧无数据记 NaN）
+            if np.isnan(feas_full) or np.isnan(feas_abl[abl_name]):
+                contributions["Feasible_" + ar_name] = float("nan")
+            else:
+                ar_f = (feas_full - feas_abl[abl_name]) / feas_full * 100.0
+                contributions["Feasible_" + ar_name] = round(ar_f, 2)
+                sum_ar_feas += ar_f
 
-        # 协同效应：Σ|AR_i| − |ΔHV_Abl-4| / HV_Full × 100%
-        synergy = sum_ar - abs(hv_abl["Abl-4"] - hv_full) / hv_full * 100.0
-        contributions["Synergy"] = round(synergy, 2)
+        # 协同效应（带符号）：Σ AR_i − (HV_Full − HV_Abl-4) / HV_Full × 100%
+        if np.isnan(hv_abl["Abl-4"]):
+            contributions["Synergy"] = float("nan")
+            contributions["Synergy_abs_legacy"] = float("nan")
+        else:
+            synergy = (
+                sum_ar - (hv_full - hv_abl["Abl-4"]) / hv_full * 100.0
+            )
+            contributions["Synergy"] = round(synergy, 2)
+            # 旧口径（已废弃）：Σ|AR_i| − |ΔHV_Abl-4| / HV_Full × 100%
+            synergy_abs = (
+                sum_ar_abs
+                - abs(hv_abl["Abl-4"] - hv_full) / hv_full * 100.0
+            )
+            contributions["Synergy_abs_legacy"] = round(synergy_abs, 2)
+
+        # feasible-HV 协同效应（带符号）
+        if np.isnan(feas_full) or np.isnan(feas_abl["Abl-4"]):
+            contributions["Feasible_Synergy"] = float("nan")
+        else:
+            contributions["Feasible_Synergy"] = round(
+                sum_ar_feas
+                - (feas_full - feas_abl["Abl-4"]) / feas_full * 100.0,
+                2,
+            )
+
+        contributions["metric_convention"] = (
+            "AR/Synergy 为带符号口径 (HV_Full - HV_i)/HV_Full*100；"
+            "*_abs_legacy 为已废弃的旧绝对值口径，仅供与旧数据对照"
+        )
+
+        # 审计 D-6：报告层接入配对 Wilcoxon + Bonferroni
+        # （方案 §5.1 实验 0 / §5.2 多重比较校正），经 run_experiments
+        # 写入 results.json 的 contributions_AR_Synergy.Wilcoxon_Bonferroni。
+        contributions["Wilcoxon_Bonferroni"] = (
+            self.compute_pairwise_significance(results)
+        )
 
         return contributions
+
+    def compute_pairwise_significance(
+        self,
+        results: Dict[str, List[AblationResult]],
+        alpha: float = 0.01,
+    ) -> Dict[str, Dict]:
+        """Full vs 各 Abl 配置的配对 Wilcoxon + Bonferroni 校正。
+
+        方案出处（审计 D-6 补齐）：
+          - §5.1 实验 0（消融）：显著性检验 = 配对 Wilcoxon 符号秩
+            检验，≥ 20 次/配置，阈值 p < 0.01；
+          - §5.2 多重比较校正：Bonferroni。实验 0 的 family 为
+            Full vs {Abl-1, Abl-2, Abl-3, Abl-4} 共 4 个配对比较，
+            校正系数 n_comparisons=4。
+
+        配对语义：同一 rep（同 seed、同一次统一参考点定标）下
+        Full 与 Abl-i 的 HV 为配对观测；仅保留两侧均为有效 HV
+        （> 0，与 compute_contributions 的口径一致）的 rep 对。
+        无有效配对或检验不可计算时 p 记 NaN——不伪造显著性，
+        与全失败配置 AR 记 NaN 的口径一致。
+
+        Args:
+            results: run() 的输出。
+            alpha: 显著性水平（方案实验 0 口径 0.01，作用在
+                Bonferroni 校正后的 p 值上）。
+
+        Returns:
+            {
+              "test": "Wilcoxon signed-rank (paired)",
+              "alpha": alpha,
+              "bonferroni_n_comparisons": 4,
+              "comparisons": {
+                "Full_vs_Abl-1": {
+                  "n_pairs": int, "statistic": float,
+                  "p_value": float, "p_value_bonferroni": float,
+                  "significant": bool,
+                  "effect_size_rank_biserial": float,
+                }, ...
+              },
+            }
+        """
+        abl_names = ["Abl-1", "Abl-2", "Abl-3", "Abl-4"]
+        full_hv = [r.hv for r in results.get("Full", [])]
+
+        raw: Dict[str, Dict] = {}
+        for name in abl_names:
+            abl_hv = [r.hv for r in results.get(name, [])]
+            # 按 rep 索引配对，仅保留两侧均有效（hv > 0）的配对
+            pairs = [
+                (a, f) for a, f in zip(abl_hv, full_hv)
+                if a > 0 and f > 0
+            ]
+            key = f"Full_vs_{name}"
+            if not pairs:
+                raw[key] = {
+                    "n_pairs": 0,
+                    "statistic": float("nan"),
+                    "p_value": float("nan"),
+                    "effect_size_rank_biserial": float("nan"),
+                }
+                continue
+            a_arr = np.array([p[0] for p in pairs])
+            f_arr = np.array([p[1] for p in pairs])
+            try:
+                res = wilcoxon_signed_rank(a_arr, f_arr, alpha=alpha)
+                raw[key] = {
+                    "n_pairs": int(len(pairs)),
+                    "statistic": float(res.statistic),
+                    "p_value": float(res.p_value),
+                    "effect_size_rank_biserial": float(res.effect_size),
+                }
+            except ValueError:
+                raw[key] = {
+                    "n_pairs": int(len(pairs)),
+                    "statistic": float("nan"),
+                    "p_value": float("nan"),
+                    "effect_size_rank_biserial": float("nan"),
+                }
+
+        # Bonferroni：family = 4 个 Full-vs-Abl 配对比较（方案 §5.2
+        # 同一实验内多重比较须校正；NaN p 透传为 NaN）
+        keys = [f"Full_vs_{n}" for n in abl_names]
+        corrected = bonferroni_correction(
+            [raw[k]["p_value"] for k in keys],
+            n_comparisons=len(abl_names),
+        )
+        comparisons: Dict[str, Dict] = {}
+        for k, p_adj in zip(keys, corrected):
+            entry = dict(raw[k])
+            entry["p_value_bonferroni"] = float(p_adj)
+            entry["significant"] = bool(
+                not np.isnan(p_adj) and p_adj < alpha
+            )
+            comparisons[k] = entry
+
+        return {
+            "test": "Wilcoxon signed-rank (paired)",
+            "alpha": float(alpha),
+            "bonferroni_n_comparisons": len(abl_names),
+            "comparisons": comparisons,
+        }

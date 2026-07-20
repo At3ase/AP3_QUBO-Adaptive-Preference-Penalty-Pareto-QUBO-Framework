@@ -1,27 +1,57 @@
 """
-kaiwu SDK 求解器实现（第 2 批修复版：TOP-K + 模拟器门禁 + 硬件自检）。
+kaiwu SDK 求解器实现（第 3 批：官方 SA 后端 + 完整版 SDK 1.3.1 兼容）。
 
 封装 kaiwu SDK 的 QuboModel 构建 + 求解链路。
 
-实测 SDK 事实（Python310 环境内省，2026-07 第 2 批修复时确认）：
-  - 当前环境 `import kaiwu` 实际解析为 kaiwu-community 1.0.4
-    （site-packages 中 kaiwu-1.3.1.dist-info 存在，但完整版 SDK 的
-    kaiwu/cim、kaiwu/classical、kaiwu/sampler 等模块文件缺失）。
-  - kaiwu-community 的 `QuboSolver.solve_qubo(model)` 源码确认只返回
-    单个最优解 (solution_dict, energy)，且不接受 num_reads —— 这是
-    审查 P0-3「TOP-K 断链」的 SDK 侧根因。
-  - TOP-K 正确链路（以社区版真实 API 重构）：
-      qubo_model_to_ising_model(model) -> (matrix, bias, vars_dict)
-      采样得到候选自旋配置 c_set（模拟退火 / 真机）
-      get_sorted_solutions(matrix, c_set, 0, negtail_ff=True, sort_solution=True)
-      -> 按能量升序的 (configs, hamiltonians)，去重后取 TOP-K
+实测 SDK 事实（完整版 kaiwu 1.3.1 重装就位后复核，Python310 环境内省）：
+  - `import kaiwu` 现为官方完整版 1.3.1：kaiwu.classical（
+    SimulatedAnnealingOptimizer 等）、kaiwu.cim（CIMOptimizer、
+    PrecisionReducer）、kaiwu.conversion、kaiwu.common 等模块齐全。
+    顶层不再直接暴露工具函数，布局差异由 _resolve_kaiwu_api() 屏蔽：
+      qubo_matrix_to_qubo_model  -> kaiwu.qubo
+      qubo_model_to_ising_model  -> kaiwu.conversion
+      get_sol_dict               -> kaiwu.core
+      get_sorted_solutions       -> 1.3.1 未提供，本地复刻（
+        kaiwu.common.hamiltonian + negtail gauge 规范化 + 能量升序；
+        已实测 energy=hamilton+bias 与 bits @ Q @ bits 完全一致，
+        误差 ~5e-15）。
+  - 官方 SimulatedAnnealingOptimizer（kaiwu.classical）API 实测：
+      __init__(initial_temperature=100, alpha=0.99,
+               cutoff_temperature=0.001, iterations_per_t=10,
+               size_limit=100, flag_evolution_history=False,
+               verbose=False, rand_seed=None, process_num=1)
+      solve(ising_matrix) -> shape=(size_limit, N) int64 ±1 候选自旋
+      配置（解空间小于 size_limit 时返回行数可少于 size_limit）；
+      rand_seed 固定时结果逐位确定（含同实例重复 solve），
+      rand_seed=None 为非确定；能量约定最小化 H=-sᵀMs（12 变量
+      蛮力对照实测达全局最优），与 kaiwu.common.hamiltonian 及
+      本文件内置 SA 口径一致。
+  - license 门禁：完整版 SDK 的 solve() 内部强制
+    kaiwu.license.verify_license，license 文件（
+    site-packages/kaiwu/license.lic）缺失时会交互式提示输入
+    user_id / sdk_code（platform.qboson.com 申请；非交互环境直接
+    抛 ValueError）。因此 license 文件缺失时不走官方 SA，显式
+    WARNING 后回退内置 SA（禁止静默回退）。
+  - SimpleSolver.solve_qubo（1.3.1，原社区版 QuboSolver 同款）
+    仍只返回单个最优解、不接受 num_reads —— 审查 P0-3「TOP-K
+    断链」的 SDK 侧根因不变，TOP-K 正确链路保持：
+      qubo_model_to_ising_model(model) -> IsingModel
+        （get_matrix() / get_bias() / get_variables()）
+      采样得到候选自旋配置 c_set（官方 SA / 内置 SA / 真机）
+      get_sorted_solutions 兼容层 -> 按能量升序 (configs, hamiltonians)
+      去重后取 TOP-K
       get_sol_dict(config[:-1] * config[-1], vars_dict) -> {var: 0/1}
       energy = hamiltonian + bias（已实测与 bits @ Q @ bits 完全一致）
-  - Ising 矩阵含 1 个 negtail 辅助变量（38 变量 -> 39x39 矩阵），
-    有效自旋 = config[:-1] * config[-1]（SDK solve_qubo 源码同款处理）。
+  - Ising 矩阵含 1 个 negtail 辅助变量（38 变量 -> 39x39 矩阵，
+    对称零对角），有效自旋 = config[:-1] * config[-1]（SDK
+    solve_qubo 源码同款处理）；H=-sᵀMs 在全局自旋翻转变换下不变，
+    采样端 negtail gauge 规范化（c * c[:, -1:]）不改变能量。
 
 模式语义（方案 D-04：先模拟器跑通全 pipeline 再上真机）：
-  - "simulator": 内置模拟退火后端（真实优化计算，非伪解），离线可用。
+  - "simulator": 官方 SimulatedAnnealingOptimizer 优先（需完整版
+                 SDK + 有效 license）；不可用或求解失败时显式
+                 WARNING 并回退内置模拟退火（真实优化计算，非伪解），
+                 离线可用。
   - "cim":       CIM 光量子真机。需要完整版 kaiwu SDK 1.3.1 + 玻色量子
                  授权；不可用时显式抛出 RuntimeError 并给出安装/授权
                  指引，禁止静默回退或返回伪解。
@@ -33,11 +63,12 @@ kaiwu SDK 求解器实现（第 2 批修复版：TOP-K + 模拟器门禁 + 硬�
     构建时的实际编码推断（_infer_bits_main：precision_split_38 →
     7 bits/主元，unified_48 → 8，unified_38 → 6），不再硬编码
     precision_split_38 布局。
-  - 矩阵格式:   b[00], b[01], ..., b[37] (qubo_matrix_to_qubo_model,
-                实测为零填充两位数字，正则兼容不填充写法)
+  - 矩阵格式:   b[0], b[1], ..., b[37]（完整版 1.3.1 不补零；社区版
+                为 b[00] 补零两位；_VAR_BRACKET 正则两种写法兼容）
 """
 
 import logging
+import os
 import re
 import time
 from typing import Dict, Any, List, Optional, Tuple
@@ -49,19 +80,105 @@ from .base import AbstractSolver, SolverResult, Solution
 logger = logging.getLogger(__name__)
 
 
+# =========================================================================
+# kaiwu 双发行版 API 兼容层
+# =========================================================================
+# kaiwu-community 1.0.4 顶层直接暴露工具函数；官方完整版 1.3.1 顶层仅
+# 暴露子模块（见文件头『实测 SDK 事实』）。_resolve_kaiwu_api() 统一
+# 解析并在进程内缓存。
+_KAIWU_API: Optional[Dict[str, Any]] = None
+
+
+def _get_sorted_solutions_shim(
+    ising_mat: np.ndarray,
+    c_set: np.ndarray,
+    offset: float = 0,
+    negtail_ff: bool = True,
+    sort_solution: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """复刻社区版 kw.get_sorted_solutions 语义（完整版 1.3.1 未提供）。
+
+    Args:
+        ising_mat: (N, N) CIM Ising 矩阵（对称零对角，末位为 negtail）。
+        c_set: (num_reads, N) 候选自旋配置（±1，含 negtail 列）。
+        offset: 附加到哈密顿量的常数偏移（本求解器调用方传 0）。
+        negtail_ff: True 时按每行 negtail 自旋做 gauge 规范化
+            （c * c[:, -1:]，negtail 列统一为 +1；H=-sᵀMs 在全局
+            自旋翻转变换下不变，能量不受影响）。
+        sort_solution: True 时按哈密顿量升序稳定排序。
+
+    Returns:
+        (configs, hamiltonians)：hamiltonians = -sᵀMs + offset
+        （与 kaiwu.common.hamiltonian 口径一致，已实测逐行吻合）。
+    """
+    from kaiwu.common import hamiltonian
+
+    c = np.asarray(c_set)
+    if negtail_ff and c.ndim == 2 and c.shape[1] > 0:
+        c = c * c[:, -1:]
+    h = np.asarray(hamiltonian(ising_mat, c), dtype=float) + float(offset)
+    if sort_solution:
+        order = np.argsort(h, kind="stable")
+        c = c[order]
+        h = h[order]
+    return c, h
+
+
+def _resolve_kaiwu_api() -> Dict[str, Any]:
+    """解析 kaiwu 工具函数（双发行版兼容），返回统一命名空间。
+
+    Returns:
+        dict: {qubo_matrix_to_qubo_model, qubo_model_to_ising_model,
+               get_sorted_solutions, get_sol_dict}
+
+    Raises:
+        ImportError: kaiwu 未安装。
+    """
+    global _KAIWU_API
+    if _KAIWU_API is None:
+        import kaiwu as kw
+
+        qm = getattr(kw, "qubo_matrix_to_qubo_model", None)
+        if qm is None:
+            from kaiwu.qubo import qubo_matrix_to_qubo_model as qm
+        conv = getattr(kw, "qubo_model_to_ising_model", None)
+        if conv is None:
+            from kaiwu.conversion import (
+                qubo_model_to_ising_model as conv,
+            )
+        gsd = getattr(kw, "get_sol_dict", None)
+        if gsd is None:
+            from kaiwu.core import get_sol_dict as gsd
+        gss = getattr(kw, "get_sorted_solutions", None)
+        if gss is None:
+            gss = _get_sorted_solutions_shim
+        _KAIWU_API = {
+            "qubo_matrix_to_qubo_model": qm,
+            "qubo_model_to_ising_model": conv,
+            "get_sorted_solutions": gss,
+            "get_sol_dict": gsd,
+        }
+    return _KAIWU_API
+
+
 class KaiwuSolver(AbstractSolver):
     """kaiwu SDK 求解器（TOP-K / 模式分支 / 硬件自检）。
 
     Args:
         mode: 求解模式 ("auto" / "cim" / "simulator")。
         top_k: 默认返回的 TOP-K 解条数；None 表示 min(num_reads, 100)。
-        **kwargs: 可选调参：
-            sa_sweeps (int): 模拟退火每次采样的扫描步数，默认 500。
+        **kwargs: 可选调参（模拟器后端；官方 SA 与内置 SA 共用同一组
+            语义参数，官方侧的映射规则见 _sample_spins_sa_official）：
+            sa_sweeps (int): 模拟退火每次采样的扫描步数（内置 SA）/
+                每次采样总翻转尝试预算（官方 SA），默认 500。
             sa_t0 / sa_t1 (float): 退火初末温度，默认 3.0 / 0.15
                 （实测调参：t1 不过低可保留 TOP-K 解多样性，
                 38 变量随机实例 1000 reads 约 60 个唯一解，
                 且 12 变量蛮力对照仍达全局最优）。
-            seed (int|None): 随机种子（None = 每次随机）。
+            sa_alpha (float): 官方 SA 降温系数 alpha，默认 0.99
+                （内置 SA 不使用）。
+            seed (int|None): 随机种子（None = 每次随机；
+                官方 SA 映射为 rand_seed）。
     """
 
     # 变量名解析正则
@@ -92,6 +209,11 @@ class KaiwuSolver(AbstractSolver):
         self._config = kwargs
         # 性能优化（2026-07-18）：每实例仅告警一次 D-06
         self._hw_warned = False
+        # 官方 SA 回退告警：每实例仅告警一次，避免批跑时日志刷屏
+        self._sa_warned = False
+        # 最近一次模拟器采样实际走过的后端（"official" / "builtin"），
+        # 仅供观测与测试断言，不影响求解语义
+        self._last_sa_backend = None
 
     @property
     def name(self) -> str:
@@ -140,25 +262,25 @@ class KaiwuSolver(AbstractSolver):
         """从 numpy QUBO 矩阵求解 (兼容旧接口)。
 
         使用 qubo_matrix_to_qubo_model 转换矩阵 → 求解。
-        变量名格式: b[00], b[01], ..., b[N-1]。
+        变量名格式: b[0], b[1], ..., b[N-1]（完整版 1.3.1 不补零；
+        社区版 b[00] 补零两位，正则兼容）。
 
         Args:
-            qubo_matrix: shape=(N,N) QUBO 矩阵 (上三角, diag=h_i)。
+            qubo_matrix: shape=(N,N) QUBO 矩阵 (上三角, diag=h_i；
+                SDK 内部对输入做双三角求和，严禁喂全对称阵)。
             num_reads: 采样次数（贯通到后端采样循环）。
             top_k: 返回的 TOP-K 解条数（按能量升序）。
 
         Returns:
             SolverResult，solutions 按能量升序。
         """
-        import kaiwu as kw
-
         n = qubo_matrix.shape[0]
 
         # D-06 硬件自检（超限 WARNING，不阻断模拟器）
         n_couplers = int(np.count_nonzero(np.triu(qubo_matrix, k=1)))
         self.check_hardware_compatibility(n_vars=n, n_couplers=n_couplers)
 
-        model = kw.qubo_matrix_to_qubo_model(qubo_matrix)
+        model = _resolve_kaiwu_api()["qubo_matrix_to_qubo_model"](qubo_matrix)
         return self._solve_model(model, n, num_reads, top_k)
 
     # =========================================================================
@@ -278,7 +400,7 @@ class KaiwuSolver(AbstractSolver):
         top_k: Optional[int],
     ) -> SolverResult:
         """共享求解核心：转换 → 采样 → TOP-K 解码。"""
-        import kaiwu as kw
+        api = _resolve_kaiwu_api()
 
         if num_reads < 1:
             raise ValueError(f"num_reads 必须 ≥ 1，得到 {num_reads}")
@@ -292,7 +414,7 @@ class KaiwuSolver(AbstractSolver):
         t_start = time.perf_counter()
 
         # QUBO -> Ising（38 变量 -> 39x39，含 1 个 negtail 辅助变量）
-        ising_model = kw.qubo_model_to_ising_model(model)
+        ising_model = api["qubo_model_to_ising_model"](model)
         ising_mat = ising_model.get_matrix()
         bias = ising_model.get_bias()
         vars_dict = ising_model.get_variables()
@@ -309,8 +431,9 @@ class KaiwuSolver(AbstractSolver):
         else:  # pragma: no cover - 真机路径，当前环境不可达
             c_set = self._sample_spins_cim(ising_mat, num_reads)
 
-        # TOP-K：按能量升序排序（SDK 官方工具函数）
-        configs, hamiltons = kw.get_sorted_solutions(
+        # TOP-K：按能量升序排序（SDK 官方工具函数 / 1.3.1 本地复刻，
+        # 见文件头『实测 SDK 事实』与 _get_sorted_solutions_shim）
+        configs, hamiltons = api["get_sorted_solutions"](
             ising_mat, c_set, 0, negtail_ff=True, sort_solution=True
         )
 
@@ -335,7 +458,168 @@ class KaiwuSolver(AbstractSolver):
     def _sample_spins_simulator(
         self, ising_mat: np.ndarray, num_reads: int
     ) -> np.ndarray:
-        """模拟器后端：内置模拟退火采样（真实优化计算，非伪解）。
+        """模拟器后端：内置 SA 为主后端，官方 SA 为 license 可用时的可选后端。
+
+        后端选择（_config["sa_backend"]，默认 "auto"）：
+          - "auto":     kaiwu.classical 可导入且玻色量子 license 文件
+                        存在时，走官方 SimulatedAnnealingOptimizer；
+                        否则回退内置 SA（每实例 WARNING 一次，禁止静默）。
+          - "builtin":  强制内置 SA（即便 license 可用；用于锁定实验
+                        可复现基线，与历史批跑结果可比）。
+          - "official": 强制官方 SA；不可用（ImportError / license 缺失）
+                        时显式抛 RuntimeError，禁止静默回退。
+
+        两条路径均为真实优化计算（非伪解），返回 shape=(m, N) 候选自旋
+        配置 c_set（±1，含 negtail 辅助变量；内置 SA 恒 m=num_reads，
+        官方 SA 在解空间小于 size_limit 时 m 可小于 num_reads），交由
+        get_sorted_solutions 兼容层统一排序。能量口径一致：最小化
+        H = -sᵀMs（与 kaiwu.common.hamiltonian 实测一致）。
+        """
+        choice = str(self._config.get("sa_backend", "auto")).lower()
+
+        if choice == "builtin":
+            self._last_sa_backend = "builtin"
+            return self._sample_spins_sa_builtin(ising_mat, num_reads)
+
+        official_cls, reason = self._official_sa_backend()
+
+        if choice == "official":
+            if official_cls is None:
+                raise RuntimeError(
+                    "sa_backend='official' 显式指定官方 "
+                    "SimulatedAnnealingOptimizer，但当前不可用："
+                    f"{reason}。请安装完整版 kaiwu SDK 1.3.1 并配置玻色"
+                    "量子 license（kaiwu.license.init(user_id, sdk_code)），"
+                    "或改用 sa_backend='auto' / 'builtin'。"
+                )
+            self._last_sa_backend = "official"
+            return self._sample_spins_sa_official(
+                official_cls, ising_mat, num_reads
+            )
+
+        if choice != "auto":
+            raise ValueError(
+                f"未知 sa_backend: {choice!r}，"
+                "可选 ('auto', 'builtin', 'official')"
+            )
+
+        # auto：官方可用则优先，失败/不可用显式回退内置 SA
+        if official_cls is not None:
+            try:
+                self._last_sa_backend = "official"
+                return self._sample_spins_sa_official(
+                    official_cls, ising_mat, num_reads
+                )
+            except Exception as exc:  # 官方求解失败：显式回退，不静默
+                reason = f"官方 SA 求解异常: {exc!r}"
+        if not self._sa_warned:
+            logger.warning(
+                "[simulator 后端] %s；显式回退内置模拟退火主后端"
+                "（本实例后续调用同，不再重复告警）。", reason,
+            )
+            self._sa_warned = True
+        else:
+            logger.debug("[simulator 后端] %s；回退内置模拟退火。", reason)
+        self._last_sa_backend = "builtin"
+        return self._sample_spins_sa_builtin(ising_mat, num_reads)
+
+    def _official_sa_backend(self):
+        """探测官方 SimulatedAnnealingOptimizer 可用性。
+
+        Returns:
+            (cls | None, reason): 可用返回
+            (SimulatedAnnealingOptimizer, "")；不可用返回
+            (None, 原因字符串)。
+
+        license 门禁：完整版 SDK 的 solve() 内部强制
+        kaiwu.license.verify_license —— license 文件缺失时会交互式
+        提示输入 user_id / sdk_code（非交互环境直接抛 ValueError），
+        因此以 license 文件存在性为前置门禁，缺失时根本不尝试官方
+        路径（避免交互式提示卡死批跑）。license 失效/qubits 超限等
+        运行时失败由 auto 分支 except 兜底并显式回退。
+        """
+        try:
+            from kaiwu.classical import SimulatedAnnealingOptimizer
+        except ImportError as exc:
+            return None, (
+                f"kaiwu.classical 导入失败（{exc!r}），"
+                "当前环境无官方 SA（如 kaiwu-community 1.0.4）"
+            )
+        try:
+            from kaiwu.license import _license_utils as lic_utils
+        except ImportError:
+            # 无 license 模块的发行版无此门禁
+            return SimulatedAnnealingOptimizer, ""
+        lic_path = getattr(lic_utils, "LICENSE_FILE_PATH", None)
+        if lic_path and not os.path.exists(lic_path):
+            return None, (
+                f"玻色量子 license 文件缺失（{lic_path}；需 "
+                "platform.qboson.com 的 user_id / sdk_code 生成）"
+            )
+        return SimulatedAnnealingOptimizer, ""
+
+    def _sample_spins_sa_official(
+        self, sa_cls, ising_mat: np.ndarray, num_reads: int
+    ) -> np.ndarray:
+        """官方 SA 采样：kaiwu.classical.SimulatedAnnealingOptimizer。
+
+        _config 参数映射（与内置 SA 同一组语义参数）：
+          seed      -> rand_seed（None = 非确定）
+          sa_t0     -> initial_temperature（默认 3.0）
+          sa_t1     -> cutoff_temperature（默认 0.15）
+          sa_alpha  -> alpha（默认 0.99，SDK 官方默认；内置 SA 不使用）
+          sa_sweeps -> 每次采样的总翻转尝试预算：官方温度为几何档
+                       T=t0·alpha^k，档数 n_T=ceil(ln(t1/t0)/ln(alpha))，
+                       故 iterations_per_t = max(1, round(sa_sweeps/n_T))
+          num_reads -> size_limit（真实贯通；解空间小于 size_limit 时
+                       SDK 返回行数可少于 num_reads，实测 8 变量
+                       size_limit=1000 返回 252 行）
+          process_num 固定 1（保证 rand_seed 确定性，不启多进程）。
+
+        实测质量提示（39 变量真实实例，seed=42，num_reads=1000）：
+        预算映射档（sa_sweeps=500 -> iterations_per_t≈2）质量低于
+        内置 SA（best E 0.162 vs 0.074）；iterations_per_t≥10
+        （sa_sweeps≥3000 或显式调参）后官方反超（best E 0.062）且
+        快约 80 倍。低预算快速批跑用内置，license 可用且追求
+        速度/质量时选官方并提高 sa_sweeps。
+
+        Returns:
+            shape=(m, N) int64 ±1（m ≤ num_reads），含 negtail 列。
+        """
+        t0 = float(self._config.get("sa_t0", 3.0))
+        t1 = float(self._config.get("sa_t1", 0.15))
+        alpha = float(self._config.get("sa_alpha", 0.99))
+        sweeps = int(self._config.get("sa_sweeps", 500))
+        seed = self._config.get("seed", None)
+
+        if 0.0 < t1 < t0 and 0.0 < alpha < 1.0:
+            n_t = max(1, int(np.ceil(np.log(t1 / t0) / np.log(alpha))))
+        else:  # 非法温度档配置时退化为单档，预算即 iterations_per_t
+            n_t = 1
+        iters_per_t = max(1, int(round(sweeps / n_t)))
+
+        worker = sa_cls(
+            initial_temperature=t0,
+            alpha=alpha,
+            cutoff_temperature=t1,
+            iterations_per_t=iters_per_t,
+            size_limit=num_reads,
+            rand_seed=seed,
+            process_num=1,
+        )
+        mat = np.ascontiguousarray(np.asarray(ising_mat, dtype=np.float64))
+        c_set = np.asarray(worker.solve(mat))
+        if c_set.ndim != 2 or c_set.shape[1] != mat.shape[0]:
+            raise RuntimeError(
+                f"官方 SA 返回形状异常: {c_set.shape}，"
+                f"预期 (*, {mat.shape[0]})"
+            )
+        return c_set.astype(np.int64, copy=False)
+
+    def _sample_spins_sa_builtin(
+        self, ising_mat: np.ndarray, num_reads: int
+    ) -> np.ndarray:
+        """内置模拟退火采样（模拟器主后端；真实优化计算，非伪解）。
 
         语义对齐 SDK IsingSolver._solve：返回 shape=(num_reads, N) 的
         候选自旋配置 c_set（±1，含 negtail 辅助变量），交由
@@ -406,7 +690,7 @@ class KaiwuSolver(AbstractSolver):
         bits_main: 每主元比特数（构建时的实际位布局，见
             _infer_bits_main），默认 7 = precision_split_38 legacy 布局。
         """
-        import kaiwu as kw
+        get_sol_dict = _resolve_kaiwu_api()["get_sol_dict"]
 
         if configs is None or len(configs) == 0:
             return []
@@ -423,7 +707,7 @@ class KaiwuSolver(AbstractSolver):
             if rank >= top_k:
                 break
             # negtail 还原有效自旋（SDK solve_qubo 源码同款处理）
-            solution_dict = kw.get_sol_dict(cfg[:-1] * cfg[-1], vars_dict)
+            solution_dict = get_sol_dict(cfg[:-1] * cfg[-1], vars_dict)
             bits = self._parse_solution(solution_dict, n_vars, bits_main)
             energy = float(ham) + float(bias)
             is_feasible, feas_meta = self._check_feasibility(bits, bits_main)

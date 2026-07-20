@@ -53,6 +53,46 @@ def set_unified_reference(
     return nadir + margins
 
 
+def compute_feasible_hv(
+    objectives: np.ndarray,
+    feasible_mask: np.ndarray,
+    reference_point: np.ndarray,
+) -> float:
+    """feasible-HV：仅对前沿中通过硬口径物理过滤的子集计算 HV。
+
+    任务 C（2026-07-19，诊断报告 reports/feasible_hv_diagnostic_2026-07-19）
+    新增，不改动本文件任何现有函数行为。
+
+    口径约定：
+      - 参考点必须由调用方在「所有配置的合并前沿」上用
+        set_unified_reference(margin=0.10) 定标后传入（方案 HV-1
+        固定参考点前提，保证组间可比）；本函数不自行定标。
+      - 可行子集为空时返回 NaN（指标不可计算，须与 0.0 区分：
+        0.0 表示可行点存在但对参考点无支配体积，NaN 表示无可行点）。
+      - 可行点超出参考点的部分由 HypervolumeCalculator.compute
+        内部按既有口径过滤。
+
+    Args:
+        objectives: shape=(N, 3) 目标值矩阵（某配置某 rep 的 Pareto 前沿）。
+        feasible_mask: shape=(N,) 布尔掩码，True = 通过硬口径过滤。
+        reference_point: shape=(3,) 统一参考点。
+
+    Returns:
+        可行子集的 HV；无可行点或输入为空时返回 NaN。
+    """
+    pts = np.asarray(objectives, dtype=float)
+    mask = np.asarray(feasible_mask, dtype=bool)
+    if pts.ndim != 2 or len(pts) == 0 or len(mask) != len(pts):
+        return float("nan")
+    feasible = pts[mask]
+    if len(feasible) == 0:
+        return float("nan")
+    calc = HypervolumeCalculator(
+        reference_point=np.asarray(reference_point, dtype=float)
+    )
+    return float(calc.compute(feasible))
+
+
 class HypervolumeCalculator:
     """3 目标最小化问题的 Hypervolume 计算器。
 
@@ -268,6 +308,15 @@ class HypervolumeCalculator:
     def _area2d(points_2d: np.ndarray, ref_2d: np.ndarray) -> float:
         """计算 2D 被支配面积（用于 3D HV 的递归基）。
 
+        算法（Validation_Auditor 修复，原实现系统性低估）：
+        按 f2 升序扫描，切片 x ∈ [f2_i, f2_{i+1}] 的覆盖高度
+        = ref3 − min{f3 : f2 ≤ f2_i}（running-min 必须取自已处理
+        的"更小 f2"点集，即切片支配集）。原实现按 f2 降序 + 前缀
+        running-min，把高度算成"相邻前沿点之间"的阶梯差，凡 2D
+        切片集合不是单点全局最小 f3 即漏算矩形条带（手算案例
+        {(1,2),(2,1)}, ref(3,3)：正确 3.0，旧实现 2.0；3D 手算
+        案例 13.0 → 8.0；随机前沿暴力网格交叉验证低估 10%~50%）。
+
         Args:
             points_2d: shape=(N, 2) (f2, f3) 值。
             ref_2d: shape=(2,) 参考点。
@@ -284,21 +333,20 @@ class HypervolumeCalculator:
         if len(pts) == 0:
             return 0.0
 
-        # 按 f2 降序排列
-        order = np.argsort(-pts[:, 0])
+        # 按 f2 升序排列
+        order = np.argsort(pts[:, 0])
         pts = pts[order]
 
         area = 0.0
-        prev_f2 = ref_2d[0]
-        min_f3 = ref_2d[1]
+        min_f3 = ref_2d[1]  # running-min：已处理点集（f2 ≤ 当前切片）的最小 f3
 
         for i in range(len(pts)):
-            f2_slice = prev_f2 - pts[i, 0]
-            if f2_slice > 0:
-                f3_span = min_f3 - pts[i, 1]
-                if f3_span > 0:
-                    area += f2_slice * f3_span
             min_f3 = min(min_f3, pts[i, 1])
-            prev_f2 = pts[i, 0]
+            # 切片右端：下一个点的 f2，末尾延伸到 ref2
+            right = pts[i + 1, 0] if i + 1 < len(pts) else ref_2d[0]
+            width = right - pts[i, 0]
+            height = ref_2d[1] - min_f3
+            if width > 0 and height > 0:
+                area += width * height
 
         return area

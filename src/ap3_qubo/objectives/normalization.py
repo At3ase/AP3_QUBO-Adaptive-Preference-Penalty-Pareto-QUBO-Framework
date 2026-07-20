@@ -9,6 +9,8 @@ from typing import Dict, Tuple
 
 import numpy as np
 
+from ..physical_params import F1_NORM_DENOM, F2_NORM_DENOM, F3_COST_MAX
+
 
 class Normalizer(ABC):
     """归一化器抽象基类。"""
@@ -32,8 +34,12 @@ class PhysicalPriorNormalizer(Normalizer):
     f₃^norm = f₃ / c_max
     """
 
-    def __init__(self, f1_denom: float = 30.0, f2_denom: float = 10.0,
-                 f3_denom: float = 6543.0):
+    def __init__(self, f1_denom: float = F1_NORM_DENOM,
+                 f2_denom: float = F2_NORM_DENOM,
+                 f3_denom: float = F3_COST_MAX):
+        # f3 默认分母统一取 physical_params.F3_COST_MAX (=6545.0)，
+        # 消除历史上 6543 vs 6545 双源不一致 (评审报告 §四-11)；
+        # 与 qubo/builder.py:442 的 f₃ 归一化保持同一数据源。
         self._denoms = np.array([f1_denom, f2_denom, f3_denom])
 
     def normalize(self, values: np.ndarray) -> np.ndarray:

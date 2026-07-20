@@ -39,13 +39,17 @@ from ..objectives.normalization import PhysicalPriorNormalizer
 from ..penalty_flex.adaptive_penalty import PenaltyFlex, FeedbackReport
 from ..penalty_flex.warm_start import LambdaCache
 from ..validation.pareto import SolutionRecord as ValidatedRecord
-from ..validation.hypervolume import HypervolumeCalculator
+from ..validation.hypervolume import HypervolumeCalculator, set_unified_reference
 from ..validation.physical_filters import PhysicalFilter, PhysicalFilterResult
 
 from .archive import Archive
 from .weight_utils import WeightGenerator, deduplicate_weights
 
 logger = logging.getLogger(__name__)
+
+# 方案 BASE-4（AP3_QUBO_Validation_Scheme_v1.1 §4.2 :160）Grid-search 网格：
+# 在 {0.1, 0.5, 1, 5, 10, 50, 100} 上穷举搜索最优固定 λ。
+GRID_SEARCH_LAMBDA_GRID: Tuple[float, ...] = (0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0)
 
 
 @dataclass
@@ -94,7 +98,7 @@ class ParetoZoom:
         penalty_fixed_lambda: float | None = None,
         exploration_strategy: str = "pareto_zoom",
         uniform_grid_n: int = 50,
-        archive_feasible_tol: float = 2.0,
+        archive_feasible_tol: float = 1.0,
         seed: int | None = None,
     ):
         """
@@ -103,14 +107,21 @@ class ParetoZoom:
             solver: QUBO 求解器（默认 KaiwuSolver(auto)，当前解析为内置经典 SA 后端）。
             builder: QUBO 构建器（默认根据 encoding_type 创建）。
             encoding_type: 编码方案（"precision_split_38", "unified_48", "unified_38"）。
-            gamma_discount: C-主元 γ 折扣因子（None 使用 MIEDEMA 默认值 0.25）。
+            gamma_discount: C-主元 γ 折扣因子（None 使用 MIEDEMA 默认值 0.3）。
             penalty_strategy: 惩罚策略（"adaptive", "fixed", "linear", "grid_search"）。
             penalty_fixed_lambda: fixed 策略使用的固定 λ 值。
             exploration_strategy: 探索策略（"pareto_zoom", "uniform_grid", "random"）。
             uniform_grid_n: uniform_grid 策略的权重网格大小。
-            archive_feasible_tol: 入档可行性容差 |Σc−100| ≤ tol（百分数点，默认 2.0 即 2%，
-                方案 §4.2.3 阶段D 步骤35 "constraints_satisfied(c, tol=2%)"）；
-                与解码器 Composition.is_feasible 默认 tolerance=1.0（兜底 1%）相区分。
+            archive_feasible_tol: 入档可行性容差 |Σc−100| ≤ tol（百分数点，默认 1.0 即 1%）。
+                任务 C 容差统一（2026-07-19，诊断报告
+                reports/feasible_hv_diagnostic_2026-07-19 §2.4 根因 3 /
+                §5 决策 2）：原默认 2.0%（方案 §4.2.3 阶段D 步骤35
+                "constraints_satisfied(c, tol=2%)"）与物理过滤器
+                SUM_TOLERANCE=1.0%（physical_params.py）不一致，
+                会在 1–2% 夹层产生"入档合法但过滤非法"的灰区解，
+                故以更严格的过滤容差为准统一为 1.0%；
+                与解码器 Composition.is_feasible 默认 tolerance=1.0
+                亦一致。需复现旧口径时可显式传 2.0。
             seed: 随机种子（默认 None 保持旧行为：求解器每次吃 OS 熵源）。
                 仅在未注入 solver 时生效——透传到内部默认构造的
                 KaiwuSolver(mode="auto", seed=seed)，使同一 (seed, 模型,
@@ -159,6 +170,10 @@ class ParetoZoom:
         # 第 3 批（Feasible Rate 真实统计）：逐解可行性记录
         # (feasible_1pct, archive_feasible)，语义见 decode_stats()。
         self._feas_records: List[Tuple[bool, bool]] = []
+        # BASE-4 grid_search 策略：全局固定最优 λ（首次使用时试跑选定一次，
+        # 之后所有权重一律复用；明细见 _grid_search_detail）。
+        self._grid_search_lambda: Optional[float] = None
+        self._grid_search_detail: Dict = {}
 
     # =========================================================================
     # 主入口
@@ -429,6 +444,13 @@ class ParetoZoom:
         new_weights = gap_weights + perturb_weights
         new_weights = deduplicate_weights(new_weights, tolerance=self._params.weight_dedup_tol)
 
+        # 审计修复（Penalty_Auditor P-D2）：补齐方案 §4.2.3 阶段C 步骤25
+        # "REMOVE w from G_new if ANY(wᵢ < 0.02)" 边界保护。
+        # 间隙中点插值可产生 0 分量权重（如 G1(1,0,0)×G4(0.5,0.5,0) 的
+        # 中点 (0.75,0.25,0)）；微扰路径 clip 后再归一化亦不严格保证 ≥0.02。
+        w_min = self._params.weight_min_bound
+        new_weights = [w for w in new_weights if min(w) >= w_min]
+
         max_per_round = self._params.max_new_weights_per_round
         if max_per_round > 0 and len(new_weights) > max_per_round:
             new_weights = new_weights[:max_per_round]
@@ -589,28 +611,81 @@ class ParetoZoom:
     def _solve_grid_search(
         self, weights: Tuple[float, float, float]
     ) -> List[ValidatedRecord]:
-        """网格搜索 λ 策略：尝试多组固定 λ，返回 HV 最优的那组。"""
-        lambda_grid = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
-        best_records: List[ValidatedRecord] = []
-        best_hv = -1.0
+        """网格搜索 λ 策略（方案 BASE-4，Validation Scheme v1.1 §4.2 :160）。
 
-        temp_calc = HypervolumeCalculator()
+        审计修正（原 :593,597-611 三处偏离 BASE-4）：
+          1. 网格改为方案 7 档 {0.1, 0.5, 1, 5, 10, 50, 100}；
+          2. 全部 λ 候选的试跑解集合并后定统一参考点，在同一参考点下
+             比 HV（P0-5 同类问题：原实现逐 λ 各自 set_reference_from_data，
+             参考点漂移导致跨 λ HV 不可比）；
+          3. 全局固定最优 λ——首次调用时在初始权重组上试跑选定一次并缓存，
+             之后所有权重一律用该固定 λ，不再逐权重各自选 λ。
+        """
+        if self._grid_search_lambda is None:
+            self._select_grid_search_lambda()
+        lam_val = self._grid_search_lambda
+        records, _ = self._solve_single_iteration(weights, lam_val, lam_val, len(self._rounds))
+        return records
 
+    def _select_grid_search_lambda(self) -> None:
+        """BASE-4 试跑：在初始权重组上穷举 7 档 λ，统一参考点下取 HV 最大者。
+
+        选中 λ 缓存到 self._grid_search_lambda（全局固定）；试跑明细存入
+        self._grid_search_detail 供实验追溯与外部探针校验。
+        全部 λ 试跑均无有效解时回退 CONSTRAINT.lambda_carbide_init。
+        """
+        lambda_grid = list(GRID_SEARCH_LAMBDA_GRID)
+        trial_weights = list(self._initial_weights)
+
+        # 试跑目标矩阵（原始物理目标，与 ablation._grid_search_fixed_lambda 同口径）
+        obj_per_lambda: Dict[float, np.ndarray] = {}
         for lam_val in lambda_grid:
-            records, _ = self._solve_single_iteration(weights, lam_val, lam_val, len(self._rounds))
-            if not records:
-                continue
+            trial_records: List[ValidatedRecord] = []
+            for w in trial_weights:
+                records, _ = self._solve_single_iteration(
+                    w, lam_val, lam_val, len(self._rounds)
+                )
+                trial_records.extend(records)
+            if trial_records:
+                obj_per_lambda[lam_val] = np.array(
+                    [r.objectives for r in trial_records], dtype=float
+                )
 
-            # 评估该 λ 的 HV
-            obj_arr = np.array([r.objectives for r in records])
-            if len(obj_arr) > 0:
-                temp_calc.set_reference_from_data(obj_arr)
-                hv = temp_calc.compute(obj_arr)
-                if hv > best_hv:
-                    best_hv = hv
-                    best_records = records
+        if not obj_per_lambda:
+            # 试跑全部失败 → 回退默认 λ（与 fixed 策略缺省口径一致）
+            self._grid_search_lambda = CONSTRAINT.lambda_carbide_init
+            self._grid_search_detail = {
+                "scheme": "BASE-4 (AP3_QUBO_Validation_Scheme_v1.1 §4.2 :160)",
+                "grid": lambda_grid,
+                "fallback": True,
+                "best_lambda": float(self._grid_search_lambda),
+            }
+            return
 
-        return best_records
+        # P0-5 口径：合并全部候选 λ 的试跑解集，统一定参考点后再比 HV。
+        ref = set_unified_reference(
+            {repr(lam): m for lam, m in obj_per_lambda.items()}, margin=0.10
+        )
+        calc = HypervolumeCalculator(reference_point=ref)
+        hv_per_lambda = {
+            lam: calc.compute(m) for lam, m in obj_per_lambda.items()
+        }
+        best_lambda = max(hv_per_lambda, key=hv_per_lambda.get)
+
+        self._grid_search_lambda = float(best_lambda)
+        self._grid_search_detail = {
+            "scheme": "BASE-4 (AP3_QUBO_Validation_Scheme_v1.1 §4.2 :160)",
+            "grid": lambda_grid,
+            "reference_point": [float(x) for x in ref],
+            "hv_per_lambda": {
+                float(lam): float(hv) for lam, hv in hv_per_lambda.items()
+            },
+            "best_lambda": float(best_lambda),
+            "trial_weights": len(trial_weights),
+            # 试跑原始目标矩阵，供探针独立复核"同一参考点"口径
+            "objectives_per_lambda": obj_per_lambda,
+            "fallback": False,
+        }
 
     def _solve_single_iteration(
         self,
@@ -657,8 +732,9 @@ class ParetoZoom:
 
             # P0-8/F-09 入档可行性过滤（方案 §4.2.3 阶段D 步骤35：
             # "IF constraints_satisfied(c, tol=2%)" 才执行 nondominated_update）。
-            # 判定 |Σc − 100| ≤ archive_feasible_tol（默认 2%，构造参数可配）；
-            # 与解码器 Composition.is_feasible 的 tolerance=1.0（兜底 1%）相区分。
+            # 判定 |Σc − 100| ≤ archive_feasible_tol（任务 C 起默认 1%，
+            # 与物理过滤器 SUM_TOLERANCE=1.0% 统一，构造参数可配）；
+            # 与解码器 Composition.is_feasible 的 tolerance=1.0 同口径。
             # 不满足的解仍记录进 solutions_data 供 PenaltyFlex 反馈用，但不入 Archive。
             archive_ok = abs(comp.total - 100.0) <= self._archive_feasible_tol
 
@@ -745,7 +821,11 @@ class ParetoZoom:
         if len(front) < 2:
             return []
 
-        points = self._archive.get_objective_matrix_norm()
+        # 审计修复（Penalty_Auditor P-D3）：HV 贡献必须在原始目标空间计算——
+        # self._hv_calc 的参考点由 get_objective_matrix()（原始尺度）设定
+        # （_phase_a_initialize / _run_round Phase E），原先用归一化矩阵
+        # 调 marginal_contribution 造成"归一化点 × 原始参考点"空间错配。
+        points = self._archive.get_objective_matrix()
         if len(points) < 2:
             return []
 

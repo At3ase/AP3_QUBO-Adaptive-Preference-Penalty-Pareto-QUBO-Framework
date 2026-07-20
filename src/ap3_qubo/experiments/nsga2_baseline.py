@@ -79,6 +79,26 @@ class NSGA2Optimizer:
         self._sorter = ParetoSort()
         self._hv_calc = HypervolumeCalculator()
 
+        # Fairness_Reporter（审计 D-2/D-3 公平性披露）：
+        # 评估预算与投影修复贴界统计。_n_objective_evals 仅计
+        # optimize() 内适应度评估（pop + Σ 各代子代），不含
+        # evaluate_front 的事后重评估（口径见 budget_stats）。
+        self._n_objective_evals = 0
+        self._repair_stats: Dict[str, object] = {
+            "n_repair_calls": 0,
+            "n_coords": 0,
+            "before_at_bound": 0,
+            "after_at_bound": 0,
+            "per_element_coords": {e: 0 for e in ALL_ELEMENTS},
+            "per_element_before": {e: 0 for e in ALL_ELEMENTS},
+            "per_element_after": {e: 0 for e in ALL_ELEMENTS},
+        }
+
+    # 贴界判定容差（Fairness_Reporter，审计 D-3）：坐标到最近边界的
+    # 距离 ≤ BOUNDARY_TOL_REL × (hi − lo) 即判定为"贴界"。0.25% 口径下
+    # 主元 tol ≈ 0.0794 at%（range 31.75）、C tol ≈ 0.0044 at%（range 1.75）。
+    BOUNDARY_TOL_REL = 0.0025
+
     @staticmethod
     def _setup_bounds() -> List[Tuple[float, float]]:
         """每个元素的成分边界 (at%)。"""
@@ -87,6 +107,49 @@ class NSGA2Optimizer:
             bounds.append((ENCODING.main_min, ENCODING.main_max))
         bounds.append((ENCODING.carbon_min, ENCODING.carbon_max))
         return bounds
+
+    @staticmethod
+    def _boundary_flags(
+        vec: List[float],
+        lows: List[float],
+        highs: List[float],
+        tol_rel: float | None = None,
+    ) -> List[bool]:
+        """逐坐标贴界判定：min(x − lo, hi − x) ≤ tol_rel × (hi − lo)。
+
+        Fairness_Reporter（审计 D-3）：越界坐标（x < lo 或 x > hi）
+        距离为负、判定为贴界——它们经投影恰被裁剪到边界上，是投影
+        修复贴界富集的直接来源，修复前统计必须将其计入。
+        """
+        rel = NSGA2Optimizer.BOUNDARY_TOL_REL if tol_rel is None else tol_rel
+        flags = []
+        for x, lo, hi in zip(vec, lows, highs):
+            tol = rel * (hi - lo)
+            flags.append((float(x) - lo) <= tol or (hi - float(x)) <= tol)
+        return flags
+
+    def _repair_and_record(
+        self, ind: List[float], lows: List[float], highs: List[float]
+    ) -> List[float]:
+        """投影修复 + 贴界统计（Fairness_Reporter，审计 D-3）。
+
+        对 _project_to_box_simplex 的输入（修复前）与输出（修复后）
+        逐坐标做贴界判定并累计计数，供 repair_boundary_stats() 汇总。
+        修复算法本体不变（第 3 批修复的投影算子语义保持原样）。
+        """
+        before = NSGA2Optimizer._boundary_flags(ind, lows, highs)
+        repaired = NSGA2Optimizer._project_to_box_simplex(ind, lows, highs)
+        after = NSGA2Optimizer._boundary_flags(repaired, lows, highs)
+        st = self._repair_stats
+        st["n_repair_calls"] += 1
+        st["n_coords"] += len(repaired)
+        st["before_at_bound"] += sum(before)
+        st["after_at_bound"] += sum(after)
+        for e, fb, fa in zip(ALL_ELEMENTS, before, after):
+            st["per_element_coords"][e] += 1
+            st["per_element_before"][e] += int(fb)
+            st["per_element_after"][e] += int(fa)
+        return repaired
 
     @staticmethod
     def _project_to_box_simplex(
@@ -169,13 +232,18 @@ class NSGA2Optimizer:
             ind = [np.random.uniform(lo, hi) for lo, hi in bounds]
             # 初始个体投影到 box∩simplex 可行域（投影必要性与收敛性
             # 论证见 _project_to_box_simplex docstring）。
-            return NSGA2Optimizer._project_to_box_simplex(ind, lows, highs)
+            # Fairness_Reporter：经 _repair_and_record 走同一投影，
+            # 同时累计修复前/后贴界统计（审计 D-3）。
+            return self._repair_and_record(ind, lows, highs)
 
         toolbox.register("individual", tools.initIterate, creator.Individual, init_individual)
         toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
         # 评估函数
         def evaluate(ind):
+            # Fairness_Reporter（审计 D-2）：适应度评估计数（四口径之
+            # #objective-evals；正式规模 pop100×gen200 ≈ 20,100 次）。
+            self._n_objective_evals += 1
             fractions = {elem: ind[i] for i, elem in enumerate(ALL_ELEMENTS)}
             dh = self._dh_calc.evaluate(fractions)
             density = self._density_calc.evaluate(fractions)
@@ -229,9 +297,10 @@ class NSGA2Optimizer:
                     # 第 3 批修复：SBX 只保边界不保成分和，交叉后立即
                     # 投影回 box∩simplex 可行域（修复算子保和，杜绝
                     # 不可行子代进入评估与前沿）。
-                    offspring[i-1][:] = NSGA2Optimizer._project_to_box_simplex(
+                    # Fairness_Reporter：经 _repair_and_record 累计贴界统计。
+                    offspring[i-1][:] = self._repair_and_record(
                         offspring[i-1], lows, highs)
-                    offspring[i][:] = NSGA2Optimizer._project_to_box_simplex(
+                    offspring[i][:] = self._repair_and_record(
                         offspring[i], lows, highs)
                     del offspring[i-1].fitness.values
                     del offspring[i].fitness.values
@@ -240,8 +309,8 @@ class NSGA2Optimizer:
                 if np.random.random() < self._mut_prob:
                     toolbox.mutate(ind)
                     # 第 3 批修复：多项式变异同样不保成分和，变异后投影。
-                    ind[:] = NSGA2Optimizer._project_to_box_simplex(
-                        ind, lows, highs)
+                    # Fairness_Reporter：经 _repair_and_record 累计贴界统计。
+                    ind[:] = self._repair_and_record(ind, lows, highs)
                     del ind.fitness.values
 
             # 重新评估
@@ -296,6 +365,62 @@ class NSGA2Optimizer:
             obj_vals.append([dh, density, cost])
         return np.array(obj_vals, dtype=float).reshape(-1, 3)
 
+    def repair_boundary_stats(self) -> Dict[str, object]:
+        """投影修复贴界率汇总（Fairness_Reporter，审计 D-3 披露）。
+
+        贴界判定：坐标到最近边界距离 ≤ 0.25%×(hi−lo)（见
+        BOUNDARY_TOL_REL / _boundary_flags；越界坐标计为贴界）。
+        rate_after > rate_before 的富集源于投影裁剪——均值无偏，
+        但坐标分布向边界富集，须在结果 metadata 与对比报告中披露。
+
+        Returns:
+            dict: tol_rel、n_repair_calls、n_coords、修复前/后总体
+            贴界率、主元/C 分组贴界率、逐元素修复后贴界率。
+        """
+        st = self._repair_stats
+        n = max(int(st["n_coords"]), 1)
+        main = [e for e in ALL_ELEMENTS if e != INTERSTITIAL_ELEMENT]
+
+        def _group_rate(count_key: str, elems: List[str]) -> float:
+            coords = sum(int(st["per_element_coords"][e]) for e in elems)
+            if coords == 0:
+                return 0.0
+            return sum(int(st[count_key][e]) for e in elems) / coords
+
+        return {
+            "tol_rel": self.BOUNDARY_TOL_REL,
+            "n_repair_calls": int(st["n_repair_calls"]),
+            "n_coords": int(st["n_coords"]),
+            "rate_before": int(st["before_at_bound"]) / n,
+            "rate_after": int(st["after_at_bound"]) / n,
+            "rate_before_main": _group_rate("per_element_before", main),
+            "rate_after_main": _group_rate("per_element_after", main),
+            "rate_before_carbon": _group_rate(
+                "per_element_before", [INTERSTITIAL_ELEMENT]),
+            "rate_after_carbon": _group_rate(
+                "per_element_after", [INTERSTITIAL_ELEMENT]),
+            "per_element_after": {
+                e: (int(st["per_element_after"][e])
+                    / int(st["per_element_coords"][e])
+                    if int(st["per_element_coords"][e]) else 0.0)
+                for e in ALL_ELEMENTS
+            },
+        }
+
+    def budget_stats(self) -> Dict[str, int]:
+        """NSGA-II 评估预算（Fairness_Reporter，审计 D-2 四口径披露）。
+
+        口径：#solves = 0、#samples = 0（NSGA-II 不经 QUBO 求解链路）；
+        #objective-evals = optimize() 内适应度评估次数
+        （pop + Σ 各代子代；正式规模 100×200 ≈ 20,100），
+        不含 evaluate_front 对前沿的事后重评估。
+        """
+        return {
+            "n_solves": 0,
+            "n_samples": 0,
+            "n_objective_evals": self._n_objective_evals,
+        }
+
     def optimize_and_evaluate(self) -> Dict[str, object]:
         """优化并计算 HV（独立运行入口）。
 
@@ -311,6 +436,10 @@ class NSGA2Optimizer:
               - "feasibility": 前沿可行性统计（第 3 批新增），
                 {"sum_min", "sum_max", "sum_mean"} —— 前沿各解
                 Σc (at%) 的最小/最大/均值，修复算子保和后应紧贴 100。
+              - "boundary_repair": 投影修复贴界率统计
+                （Fairness_Reporter，审计 D-3；repair_boundary_stats）。
+              - "budget": 评估预算四口径之三
+                （Fairness_Reporter，审计 D-2；budget_stats）。
         """
         front = self.optimize()
         result: Dict[str, object] = {
@@ -319,6 +448,8 @@ class NSGA2Optimizer:
             "objectives": np.zeros((0, 3)),
             "hv": 0.0,
             "feasibility": {"sum_min": 0.0, "sum_max": 0.0, "sum_mean": 0.0},
+            "boundary_repair": self.repair_boundary_stats(),
+            "budget": self.budget_stats(),
         }
         if not front:
             return result

@@ -45,3 +45,6 @@ scratch/
 
 # Reports output (生成式报告，非方案文档)
 reports/
+
+# Literature references (文献PDF与图片证据，通过DOI引用)
+references/

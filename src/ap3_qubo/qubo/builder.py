@@ -46,8 +46,6 @@ def _ensure_kaiwu():
     if _kw is None:
         try:
             import kaiwu as _kaiwu_mod  # noqa: F811
-            _kw = _kaiwu_mod
-            _quicksum = _kaiwu_mod.quicksum
         except ImportError:
             raise ImportError(
                 "kaiwu SDK 未安装。QUBO 模型构建与求解需要 kaiwu>=1.3。\n"
@@ -55,6 +53,32 @@ def _ensure_kaiwu():
                 "（实验模块可在无 kaiwu 环境下导入和检查，"
                 "但调用 build_model() / solve() 前必须先安装。）"
             )
+        # kaiwu 两种发行版顶层布局不同，做双向兼容：
+        #   - kaiwu-community 1.0.4: 顶层直接暴露 Binary/quicksum/QuboModel，
+        #     且 quicksum 接受 generator；
+        #   - 官方完整版 kaiwu 1.3.1: 顶层仅暴露子模块，
+        #     Binary/quicksum 在 kaiwu.core, QuboModel 在 kaiwu.qubo，
+        #     且 quicksum 仅接受 list（C 扩展签名, 实测 TypeError on generator）。
+        import types
+
+        if hasattr(_kaiwu_mod, "Binary") and hasattr(_kaiwu_mod, "QuboModel"):
+            _kw = _kaiwu_mod
+            _qs_raw = _kaiwu_mod.quicksum
+        else:
+            from kaiwu.core import Binary as _Binary, quicksum as _qs_raw
+            from kaiwu.qubo import QuboModel as _QuboModel
+
+            _kw = types.SimpleNamespace(
+                Binary=_Binary, quicksum=None, QuboModel=_QuboModel
+            )
+
+        def _quicksum_list(iterable):
+            """统一 quicksum 调用约定: 接受任意 iterable, 内部转 list。"""
+            return _qs_raw(list(iterable))
+
+        _quicksum = _quicksum_list
+        if isinstance(_kw, types.SimpleNamespace):
+            _kw.quicksum = _quicksum_list
     return _kw, _quicksum
 
 # Kaiwu variable naming scheme (avoids x_0..x_37 collision bug):
@@ -110,6 +134,10 @@ class QUBOBuilder:
       - "precision_split_38": AP³ 默认，主元各 7 比特 + C 3 比特（38 变量）
       - "unified_48": 统一编码，6 元素各 8 比特（48 变量）
       - "unified_38": 统一编码，6 元素用满 38 比特（主元 6 比特 + C 8 比特）
+
+    三种编码的元素取值范围一致（主元 [5, 36.75] at%、C [0, 1.75] at%，
+    任务 C 消融变量纯净化，见 _ENCODING_CONFIGS 注释）；差异仅在
+    比特分配（分层精度 vs 统一精度）。
     """
 
     # 编码配置表
@@ -124,25 +152,34 @@ class QUBOBuilder:
             "step_carbon": 0.25,
             "element_ranges": "precision",  # element-specific bounds
         },
+        # 任务 C（2026-07-19，诊断报告 reports/feasible_hv_diagnostic_2026-07-19
+        # §3.2）消融变量纯净化：unified_48 / unified_38 的元素范围改为与
+        # precision_split_38（Full）完全一致——主元 [5, 36.75] at%、
+        # C [0, 1.75] at%，唯一保留的消融变量是「统一比特精度、无分组结构」。
+        # 旧配置主元/C 同为 [5, 35] at%：C ≥ 5 at% 使 Abl-1/Abl-4 的每个
+        # 可能解必然触发碳化物高风险（CARBIDE_RISK_ABSOLUTE=1.0），消融变量
+        # 被搜索范围污染；formal_exp0_reps20 的 Abl-1/Abl-4 结果因此作废，
+        # 重跑前必须使用本配置。实验 1（comparison.py compare_encoding）
+        # 同样读本表，编码对比口径随之同步纯净。
         "unified_48": {
             "n_vars": 48,
             "bits_main": 8,
             "bits_carbon": 8,
             "base_main": 5.0,
-            "base_carbon": 5.0,
-            "step_main": 30.0 / 255.0,      # (35-5)/(2^8-1) ≈ 0.1176
-            "step_carbon": 30.0 / 255.0,
-            "element_ranges": "hea_uniform",  # all in [5, 35]
+            "base_carbon": 0.0,
+            "step_main": 31.75 / 255.0,     # (36.75-5)/(2^8-1) ≈ 0.1245
+            "step_carbon": 1.75 / 255.0,    # (1.75-0)/(2^8-1) ≈ 0.00686
+            "element_ranges": "precision_split_aligned",  # 与 Full 同范围
         },
         "unified_38": {
             "n_vars": 38,
             "bits_main": 6,
             "bits_carbon": 8,
             "base_main": 5.0,
-            "base_carbon": 5.0,
-            "step_main": 30.0 / 63.0,       # (35-5)/(2^6-1) ≈ 0.476
-            "step_carbon": 30.0 / 255.0,
-            "element_ranges": "hea_uniform",
+            "base_carbon": 0.0,
+            "step_main": 31.75 / 63.0,      # (36.75-5)/(2^6-1) ≈ 0.5040
+            "step_carbon": 1.75 / 255.0,    # (1.75-0)/(2^8-1) ≈ 0.00686
+            "element_ranges": "precision_split_aligned",
         },
     }
 

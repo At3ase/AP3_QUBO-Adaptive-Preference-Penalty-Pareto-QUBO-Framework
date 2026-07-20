@@ -128,12 +128,23 @@ class PhysicalFilter:
         """
         # 归一化到 [0, 1]
         c = {e: fractions.get(e, 0.0) / 100.0 for e in ALL_ELEMENTS}
-        c_main = {e: c[e] for e in MAIN_ELEMENTS}
+        # c_i' 主元归一化（hea_encoding_scheme_v1.13.md :281：
+        # "c_i' = c_i / (1 − c_C)  // 主元归一化（扣除C的间隙占比）"）。
+        # VEC/δ/ΔS_mix/Δχ 的 Σ c_i' 均以主元归一化到和为 1 为方案口径；
+        # C 为间隙原子，不占据晶格置换位（v1.13 :284 物理说明）。
+        # 原实现直接用 c_i（未归一化），C>0 时 VEC 低估 ~c_C、δ/Δχ/Ω
+        # 系统性偏移（C=1.75at% 实测偏差：VEC −1.75%、δ +6.0%、
+        # Ω −4.5%、Δχ +2.4%，可致边界判定翻转）。
+        main_total = sum(c[e] for e in MAIN_ELEMENTS)
+        if main_total > 1e-12:
+            c_main = {e: c[e] / main_total for e in MAIN_ELEMENTS}
+        else:
+            c_main = {e: 0.0 for e in MAIN_ELEMENTS}
 
         # 计算各项指标
         vec = self._compute_vec(c_main)
         delta = self._compute_delta(c_main)
-        omega = self._compute_omega(c_main, dh_mix)
+        omega = self._compute_omega(c_main, dh_mix, c_all=c)
         delta_chi = self._compute_delta_chi(c_main)
 
         # 检查
@@ -303,11 +314,12 @@ class PhysicalFilter:
 
     @staticmethod
     def _compute_vec(c_main: Dict[str, float]) -> float:
-        """价电子浓度 VEC = Σ c_i^frac · VEC_i。"""
+        """价电子浓度 VEC = Σ c_i' · VEC_i（c_i' 主元归一化，v1.13 :278）。"""
         return sum(c_main[e] * ELEM.vec_of(e) for e in MAIN_ELEMENTS)
 
     def _compute_delta(self, c_main: Dict[str, float]) -> float:
-        """原子尺寸差异 δ = sqrt(Σ c_i · (1 − r_i/r̄)²) × 100%。"""
+        """原子尺寸差异 δ = sqrt(Σ c_i' · (1 − r_i/r̄)²) × 100%，
+        r̄ = Σ c_i'·r_i（c_i' 主元归一化，v1.13 :683-684）。"""
         radii = {e: ELEM.radius_of(e) for e in MAIN_ELEMENTS}
         r_bar = sum(c_main[e] * radii[e] for e in MAIN_ELEMENTS)
         if r_bar < 1e-9:
@@ -319,13 +331,28 @@ class PhysicalFilter:
         return float(np.sqrt(max(variance, 0.0)) * 100.0)
 
     def _compute_omega(
-        self, c_main: Dict[str, float], dh_mix: float
+        self,
+        c_main: Dict[str, float],
+        dh_mix: float,
+        c_all: Optional[Dict[str, float]] = None,
     ) -> float:
         """热力学参数 Ω = T_m · ΔS_mix / |ΔH_mix|。
 
+        方案口径（hea_encoding_scheme_v1.13.md :690-691）：
+          - ΔS_mix = −R·Σ c_i'·ln(c_i')，仅 5 主元，c_i' 主元归一化
+            （C 为间隙原子不贡献位形熵）；
+          - T_m = Σ_{i∈主元∪{C}} c_i·T_{m,i}，混合熔点**含 C**
+            （c_i 为原始原子分数，未归一化）。
+
         当 ΔH_mix ≈ 0 时返回一个大值（表示高度稳定）。
+
+        Args:
+            c_main: 主元归一化成分（Σ=1）。
+            dh_mix: 混合焓 (kJ/mol)。
+            c_all: 含 C 的原始原子分数字典（T_m 用）；缺省退化为
+                仅用 c_main（仅供无 C 场景的旧调用兼容）。
         """
-        # 理想混合熵 ΔS_mix = −R · Σ c_i · ln(c_i)
+        # 理想混合熵 ΔS_mix = −R · Σ c_i' · ln(c_i')（仅主元）
         delta_s = 0.0
         for e in MAIN_ELEMENTS:
             ci = c_main[e]
@@ -333,10 +360,16 @@ class PhysicalFilter:
                 delta_s -= ci * np.log(ci)
         delta_s *= R_GAS  # J/(mol·K)
 
-        # 加权熔点
-        t_m = sum(
-            c_main[e] * ELEM.melting_point_of(e) for e in MAIN_ELEMENTS
-        )
+        # 加权熔点 T_m（含 C，v1.13 :690）
+        if c_all is not None:
+            t_m = sum(
+                c_all.get(e, 0.0) * ELEM.melting_point_of(e)
+                for e in ALL_ELEMENTS
+            )
+        else:
+            t_m = sum(
+                c_main[e] * ELEM.melting_point_of(e) for e in MAIN_ELEMENTS
+            )
 
         abs_dh = abs(dh_mix)
         if abs_dh < 1e-9:
@@ -346,7 +379,8 @@ class PhysicalFilter:
 
     @staticmethod
     def _compute_delta_chi(c_main: Dict[str, float]) -> float:
-        """电负性差异 Δχ = sqrt(Σ c_i · (χ_i − χ̄)²)。"""
+        """电负性差异 Δχ = sqrt(Σ c_i' · (χ_i − χ̄)²)，
+        χ̄ = Σ c_i'·χ_i（c_i' 主元归一化，v1.13 :698-699）。"""
         chi = {e: ELEM.en_of(e) for e in MAIN_ELEMENTS}
         chi_bar = sum(c_main[e] * chi[e] for e in MAIN_ELEMENTS)
         variance = sum(

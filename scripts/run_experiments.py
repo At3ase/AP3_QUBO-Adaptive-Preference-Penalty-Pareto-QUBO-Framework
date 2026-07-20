@@ -11,7 +11,7 @@
             PrecisionSplit(38) vs Unified(48) vs Unified(38)）
   - 实验 2: PenaltyFlex 对比（compare_penalty，6 组惩罚策略）
   - 实验 3: ParetoZoom 对比（compare_exploration，4 种探索方法 + NSGA-II）
-  - 实验 4: γ 敏感性分析（SensitivityAnalyzer，6 个 γ 值，基准 0.25）
+  - 实验 4: γ 敏感性分析（SensitivityAnalyzer，5 个 γ 值，基准 0.3）
 
 用法（必须 Python310 环境，默认 python3.12 无 kaiwu）：
 
@@ -54,6 +54,9 @@
   exp{0,1,2,3,4}/records.csv     逐 rep 原始记录
   exp{0,1,2,3,4}/report.md       统计报告（0/1/2/3 用 statistics.reporting；
                                  4 用 SensitivityAnalyzer.report 的 γ 表格）
+  exp0/fronts/{config}_rep{NN}.npz  逐 rep 逐配置 Pareto 前沿（任务 C：
+                                 objectives + fractions + 硬口径可行掩码，
+                                 供 feasible-HV 分析与物理核查）
   exp{0,1,2,3,4}/representative_front.npz         代表性 run 前沿/HV/λ 原始数据
   exp{0,1,2,3,4}/representative_compositions.csv  前沿成分表
   exp{0,1,2,3,4}/*.png           Pareto 2D/3D、HV 收敛、λ 轨迹、成分热力图、
@@ -421,7 +424,8 @@ def run_experiment_0(args, out_root: Path) -> Dict[str, Any]:
     log(f"  [exp0] AblationRunner.run(n_repetitions={args.reps}, seed={args.seed}) ...")
 
     runner = AblationRunner()
-    results = runner.run(n_repetitions=args.reps, seed=args.seed)
+    results = runner.run(n_repetitions=args.reps, seed=args.seed,
+                         fronts_dir=exp_dir / "fronts")
     contributions = runner.compute_contributions(results)
 
     agg: Dict[str, Dict[str, List[float]]] = {"HV": {}, "Front Size": {}}
@@ -434,12 +438,21 @@ def run_experiment_0(args, out_root: Path) -> Dict[str, Any]:
             err = r.extra.get("error", "")
             if err:
                 n_errors += 1
+            # 任务 C：软指标（VEC/δ/Ω/ΔH_mix 各窗口单独通过率，
+            # 单列不进门槛）；未计算时为空字符串
+            soft = r.extra.get("soft_pass_rates", {})
+            soft_cols = [
+                f"{soft[k]:.4f}" if k in soft else ""
+                for k in ("vec", "delta", "omega", "dh_mix")
+            ]
             rows.append([config, rep, f"{r.hv:.6f}", r.front_size,
                          f"{r.feasible_rate:.4f}", f"{r.physical_pass_rate:.4f}",
-                         err])
+                         f"{r.feasible_hv:.6f}"] + soft_cols + [err])
     _write_csv(exp_dir / "records.csv",
                ["config", "rep", "hv", "front_size", "feasible_rate",
-                "physical_pass_rate", "error"], rows)
+                "physical_pass_rate", "feasible_hv",
+                "vec_pass_rate", "delta_pass_rate", "omega_pass_rate",
+                "dh_mix_pass_rate", "error"], rows)
 
     log("  [exp0] 代表性 run（Full 配置）+ 出图 ...")
     archive, rounds, _ = _representative_run(args)
@@ -462,9 +475,27 @@ def run_experiment_0(args, out_root: Path) -> Dict[str, Any]:
     }
     (exp_dir / "results.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    (exp_dir / "report.md").write_text(
-        _stats_to_report_md(agg, result["name"], baseline="Full"),
-        encoding="utf-8")
+    # 任务 C：报告追加消融贡献指标口径说明（含旧绝对值口径废弃声明）
+    report_md = _stats_to_report_md(agg, result["name"], baseline="Full")
+    report_md += (
+        "\n\n## 消融贡献指标口径说明（任务 C，2026-07-19）\n\n"
+        "- **AR / Synergy（当前口径，带符号）**："
+        "AR_i = (HV_Full − HV_i) / HV_Full × 100%，正值 = 组件有正贡献"
+        "（去掉它 HV 下降），负值 = 组件在该口径下为负贡献。\n"
+        "- **`*_abs_legacy`（已废弃）**：旧绝对值口径 |ΔHV_i| / HV_Full，"
+        "会把「去掉组件 HV 反升」伪装成正贡献（formal_exp0_reps20 的 HV "
+        "方向性矛盾即源于此，见 reports/feasible_hv_diagnostic_2026-07-19）；"
+        "仅保留供与旧数据对照，**不得用于结论**。\n"
+        "- **Feasible_AR_* / Feasible_Synergy**：基于 feasible_hv"
+        "（硬口径可行子集 HV：仅排除 Ω 不稳定 / 碳化物高风险 / 成分和超差）"
+        "的带符号口径；空可行集记 NaN。\n"
+        "- **feasible_rate**：硬口径可行率；**physical_pass_rate** 为 "
+        "strict all_pass 通过率（VEC 窗口结构性不可达，该口径仅作记录，"
+        "不作门槛）；vec/delta/omega/dh_mix_pass_rate 为各窗口单独"
+        "通过率（软指标，不进门槛）。\n"
+        "- 逐 rep 逐配置前沿已落盘 `fronts/{config}_rep{NN}.npz`。\n"
+    )
+    (exp_dir / "report.md").write_text(report_md, encoding="utf-8")
     log(f"  [exp0] 完成，耗时 {runtime:.1f}s | contributions={contributions}")
     return result
 
@@ -560,13 +591,14 @@ def run_experiment_3(args, out_root: Path) -> Dict[str, Any]:
 
 
 def run_experiment_4(args, out_root: Path) -> Dict[str, Any]:
-    """实验 4：γ 敏感性分析（SensitivityAnalyzer，基准 γ=0.25）。
+    """实验 4：γ 敏感性分析（SensitivityAnalyzer，基准 γ=0.3）。
 
     SensitivityAnalyzer 为类接口（非 compare_* 函数签名），驱动层单独
     实现，落盘结构与 0/1/2/3 对齐：records.csv 记逐 γ×rep 原始 HV，
     report.md 用实验层自带的 γ 表格报告，代表性 run + 出图沿用公共工具。
-    γ 列表保持默认 6 值（quick 与 formal 结构一致，仅单次 run 规模缩放，
-    与实验 2 quick 保留 6 组策略同约定）；reps 经 CLI --reps 贯通。
+    γ 列表保持默认 5 值 [0.1, 0.2, 0.3, 0.4, 0.5]（基准 γ=0.3，即
+    MIEDEMA.gamma_discount；quick 与 formal 结构一致，仅单次 run 规模
+    缩放，与实验 2 quick 保留 6 组策略同约定）；reps 经 CLI --reps 贯通。
     """
     from ap3_qubo.experiments.sensitivity import SensitivityAnalyzer
 
@@ -665,6 +697,8 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: List[str] | None = None) -> int:
+    # 强制 stdout UTF-8，避免重定向管道时 GBK 编码错误（如 AP³ → \xb3）
+    sys.stdout.reconfigure(encoding="utf-8")
     args = parse_args(argv)
     total_t0 = time.perf_counter()
 

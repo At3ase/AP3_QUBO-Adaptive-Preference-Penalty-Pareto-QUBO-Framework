@@ -43,9 +43,12 @@ class MixingEnthalpy:
                 dh_sub += MIEDEMA.get_dh(ei, ej) * c[ei] * c[ej]
 
         # 间隙 C 的有效混合焓 (折扣后)
+        # 注意: 必须使用 self.gamma 而非 MIEDEMA.get_dh("C", ·)
+        # (后者恒用全局 MIEDEMA.gamma_discount), 否则实例级 γ
+        # (γ 敏感性实验: 方案 §4.1 建议 γ=0.1/0.3/0.5) 会被静默忽略。
         dh_int = 0.0
         for elem in MAIN_ELEMENTS:
-            dh_int += MIEDEMA.get_dh("C", elem) * c[elem] * c["C"]
+            dh_int += self.gamma * MIEDEMA.dh_carbon[elem] * c[elem] * c["C"]
 
         return 4.0 * dh_sub + 4.0 * dh_int
 
@@ -65,7 +68,7 @@ class MixingEnthalpy:
 
         dh_int = 0.0
         for i in range(5):
-            dh_int += MIEDEMA.get_dh("C", MAIN_ELEMENTS[i]) * c_array[i] * c_array[5]
+            dh_int += self.gamma * MIEDEMA.dh_carbon[MAIN_ELEMENTS[i]] * c_array[i] * c_array[5]
 
         return 4.0 * dh_sub + 4.0 * dh_int
 

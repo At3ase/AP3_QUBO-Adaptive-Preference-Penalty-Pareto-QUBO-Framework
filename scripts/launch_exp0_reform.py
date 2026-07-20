@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Detach-spawn exp0 formal run so it survives the Bash tool's 300s foreground cap."""
+"""Detach-spawn exp0 reform rerun (feasible-HV + signed AR + purified ablation variable).
+
+启动背景：2026-07-19 消融评价口径改革（见 plan/ablation_evaluation_reform_2026-07-19.md），
+旧口径结果保留在 data/results/formal_exp0_reps20（deprecated，仅作历史对照），
+本脚本输出到新目录 formal_exp0_reps20_reform，避免覆盖旧数据。
+"""
 import subprocess
 import sys
 import os
-import time
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # project root
 os.chdir(BASE_DIR)
-log_path = os.path.join(BASE_DIR, "data", "results", "exp0_bg_run_reps20_v2.log")
+log_path = os.path.join(BASE_DIR, "data", "results", "exp0_bg_run_reform.log")
 os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
 DETACHED_PROCESS = 0x00000008
@@ -19,7 +23,7 @@ cmd = [
     "--experiment", "0",
     "--reps", "20",
     "--seed", "42",
-    "--out", "data/results/formal_exp0_reps20",
+    "--out", "data/results/formal_exp0_reps20_reform",
 ]
 
 log = open(log_path, "ab", buffering=0)

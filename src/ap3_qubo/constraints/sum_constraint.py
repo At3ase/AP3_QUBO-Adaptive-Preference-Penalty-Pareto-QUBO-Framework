@@ -92,14 +92,20 @@ class SumTo100Constraint:
     def evaluate_penalty(self, fractions: dict[str, float]) -> float:
         """直接评估 P0 惩罚值 (用于诊断)。
 
+        与 get_qubo_terms 严格对账：统一采用方案
+        hea_encoding_scheme_v1.13.md §3.1 的归一化形式
+        λ_sum × (S_var/75 - 1)² (S_var = Σc_k - 25)。
+        历史上此处实现为 λ_sum×(Σc_k/100−1)²，与 QUBO 项相差
+        (75/100)²=0.5625 倍，导致诊断值与 QUBO 能量不可对账
+        (评审报告 P0-1 附带项)，现已收敛到方案公式。
+
         Args:
             fractions: 元素 → at% 字典。
 
         Returns:
-            λ_sum × (Σc_k/100 - 1)² (使用比例形式)。
+            λ_sum × (S_var/75 - 1)²。
         """
-        total = sum(fractions.values()) / 100.0  # → [0, ~1.6]
-        return self.lambda_sum * (total - 1.0) ** 2
+        return self.evaluate_normalized(fractions)
 
     def evaluate_normalized(self, fractions: dict[str, float]) -> float:
         """评估归一化形式的 P0 惩罚。
